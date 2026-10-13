@@ -20,9 +20,12 @@ CREATE TABLE IF NOT EXISTS memories (
     source_message TEXT,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_session_memory_key UNIQUE (session_id, memory_key)
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_session_active_memory_key 
+ON memories (session_id, memory_key) 
+WHERE is_active = TRUE;
 
 CREATE INDEX IF NOT EXISTS idx_memories_session_id ON memories (session_id);
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories (category);
