@@ -10,9 +10,11 @@ class Settings(BaseSettings):
     NEBIUS_BASE_URL: str = "https://api.tokenfactory.nebius.com/v1"
     NEBIUS_MODEL: str = "nvidia/Nemotron-3_5-Lightning"
     FRONTEND_ORIGIN: str = "http://localhost:5173"
+    DATABASE_URL: str = ""
+    DATABASE_URL_UNPOOLED: str = ""
 
     model_config = SettingsConfigDict(
-        env_file=(str(ENV_FILE), ".env"),
+        env_file=(str(ENV_FILE), ".env", str(Path(__file__).resolve().parent.parent.parent / ".env.local")),
         env_file_encoding="utf-8",
         extra="ignore"
     )
