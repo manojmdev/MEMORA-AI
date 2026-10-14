@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
 from uuid import UUID
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,7 @@ from app.schemas import (
     ChatResponse,
     MemoryListResponse,
     MemoryRecord,
+    ScoredMemoryRecord,
     DeleteResponse
 )
 from app.services.memory_context import generate_personalized_response
@@ -17,8 +19,12 @@ from app.services.memory_service import (
     list_memories,
     get_memory,
     delete_memory,
-    delete_all_memories
+    delete_all_memories,
+    backfill_missing_embeddings
 )
+from app.services.hybrid_retriever import retrieve_hybrid_memories
+from app.services.semantic_retriever import default_semantic_retriever
+from app.services.memory_retriever import default_retriever as keyword_retriever
 from app.database import init_db_pool, close_db_pool, check_db_health
 
 logging.basicConfig(level=logging.INFO)
@@ -26,9 +32,11 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting MEMORA AI API with Memory Evolution Engine...")
+    logger.info("Starting MEMORA AI API with Semantic & Hybrid Memory Retrieval Engine...")
     try:
         await init_db_pool()
+        # Non-blocking backfill of missing embeddings
+        asyncio.create_task(backfill_missing_embeddings())
     except Exception as e:
         logger.error(f"Database pool initialization warning: {e}")
     yield
@@ -37,8 +45,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="MEMORA AI API",
-    description="Private AI Memory and Agent Intelligence Platform with Memory Evolution Engine",
-    version="0.2.0",
+    description="Private AI Memory and Agent Intelligence Platform with Semantic & Hybrid Retrieval",
+    version="0.3.0",
     lifespan=lifespan
 )
 
@@ -84,6 +92,63 @@ async def chat(request: ChatRequest):
         )
     except Exception as e:
         logger.error(f"Chat execution failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/memories/search", response_model=List[ScoredMemoryRecord])
+async def search_memories(
+    q: str = Query(..., min_length=1, description="Search query string"),
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    category: Optional[str] = Query(default=None, description="Optional category filter"),
+    mode: str = Query(default="hybrid", description="Search mode: 'hybrid', 'semantic', or 'keyword'"),
+    limit: int = Query(default=5, ge=1, le=20)
+):
+    """
+    Search active memories for a session using hybrid (semantic + keyword),
+    semantic-only (pgvector), or keyword-only retrieval.
+    """
+    try:
+        if mode == "semantic":
+            return await default_semantic_retriever.retrieve(
+                session_id=session_id, query=q, category=category, limit=limit
+            )
+        elif mode == "keyword":
+            records = await keyword_retriever.retrieve(
+                session_id=session_id, query=q, category=category, limit=limit
+            )
+            return [
+                ScoredMemoryRecord(
+                    id=r.id,
+                    session_id=r.session_id,
+                    category=r.category,
+                    memory_type=r.memory_type,
+                    memory_key=r.memory_key,
+                    content=r.content,
+                    confidence_score=r.confidence_score,
+                    importance_score=r.importance_score,
+                    information_source=r.information_source,
+                    persistence_type=r.persistence_type,
+                    memory_status=r.memory_status,
+                    reason_for_storage=r.reason_for_storage,
+                    valid_from=r.valid_from,
+                    valid_until=r.valid_until,
+                    last_confirmed_at=r.last_confirmed_at,
+                    source_message=r.source_message,
+                    is_active=r.is_active,
+                    created_at=r.created_at,
+                    updated_at=r.updated_at,
+                    retrieval_method="keyword",
+                    similarity_score=1.0,
+                    relevance_score=r.confidence_score,
+                    retrieval_reason="Exact keyword and token match on query terms."
+                )
+                for r in records
+            ]
+        else:
+            return await retrieve_hybrid_memories(
+                session_id=session_id, query=q, category=category, limit=limit
+            )
+    except Exception as e:
+        logger.error(f"Search endpoint error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/memories", response_model=MemoryListResponse)
@@ -152,3 +217,15 @@ async def clear_session_memories(
     except Exception as e:
         logger.error(f"Error clearing memories: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/evaluation/run")
+async def run_evaluation_benchmark():
+    """Run the Day 5 quantitative retrieval evaluation benchmark suite."""
+    from app.evaluation.retrieval_evaluator import run_retrieval_evaluation
+    try:
+        summary = await run_retrieval_evaluation()
+        return summary
+    except Exception as e:
+        logger.error(f"Evaluation benchmark failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+

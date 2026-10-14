@@ -67,12 +67,14 @@ class KeywordMemoryRetriever(BaseMemoryRetriever):
         keywords = extract_keywords(query)
 
         async with pool.acquire() as conn:
-            # Query all active memories for the isolated session
+            # Query all active, non-expired memories for the isolated session
             if category:
                 rows = await conn.fetch(
                     """
                     SELECT * FROM memories 
-                    WHERE session_id = $1 AND is_active = TRUE AND category = $2
+                    WHERE session_id = $1 AND is_active = TRUE 
+                      AND (valid_until IS NULL OR valid_until > NOW())
+                      AND category = $2
                     ORDER BY updated_at DESC
                     LIMIT 50
                     """,
@@ -84,6 +86,7 @@ class KeywordMemoryRetriever(BaseMemoryRetriever):
                     """
                     SELECT * FROM memories 
                     WHERE session_id = $1 AND is_active = TRUE
+                      AND (valid_until IS NULL OR valid_until > NOW())
                     ORDER BY updated_at DESC
                     LIMIT 50
                     """,
@@ -99,7 +102,7 @@ class KeywordMemoryRetriever(BaseMemoryRetriever):
                 records.sort(key=lambda r: (r.confidence_score, r.updated_at), reverse=True)
                 return records[:limit]
 
-            # Score each memory by keyword overlap and confidence
+            # Score each memory by keyword overlap and confidence using word tokens
             scored: List[tuple[float, MemoryRecord]] = []
             for record in records:
                 score = 0.0
@@ -107,12 +110,17 @@ class KeywordMemoryRetriever(BaseMemoryRetriever):
                 content_lower = record.content.lower()
                 cat_lower = record.category.lower()
 
+                # Tokenize memory fields into distinct word sets
+                key_tokens = set(re.findall(r"\b[a-zA-Z0-9_-]+\b", mem_key_lower))
+                content_tokens = set(re.findall(r"\b[a-zA-Z0-9_-]+\b", content_lower))
+                cat_tokens = set(re.findall(r"\b[a-zA-Z0-9_-]+\b", cat_lower))
+
                 for kw in keywords:
-                    if kw in mem_key_lower:
+                    if kw in key_tokens or kw == mem_key_lower:
                         score += 3.0
-                    if kw in content_lower:
+                    elif kw in content_tokens:
                         score += 2.0
-                    if kw in cat_lower:
+                    elif kw in cat_tokens:
                         score += 1.0
 
                 # Weight by confidence

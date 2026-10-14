@@ -1,33 +1,73 @@
 import asyncio
 import logging
+import uuid
 import zlib
 from typing import List, Optional
 from uuid import UUID
 import asyncpg
 from app.database import get_db_pool
-from app.schemas import MemoryCandidate, MemoryRecord
+from app.schemas import (
+    MemoryCandidate,
+    MemoryRecord,
+    MemoryType,
+    InformationSource,
+    PersistenceType,
+    MemoryStatus
+)
+from app.services.embedding_service import generate_embedding, vector_to_sql_str
 
 logger = logging.getLogger(__name__)
 
 def record_from_row(row: asyncpg.Record) -> MemoryRecord:
     """Convert an asyncpg database record into a validated Pydantic MemoryRecord."""
+    has_emb = False
+    if "embedding" in row:
+        has_emb = row["embedding"] is not None
+
     return MemoryRecord(
         id=row["id"],
         session_id=row["session_id"],
         category=row["category"],
+        memory_type=row.get("memory_type") or MemoryType.GENERAL_FACT.value,
         memory_key=row["memory_key"],
         content=row["content"],
         confidence_score=row["confidence_score"],
+        importance_score=float(row.get("importance_score") if row.get("importance_score") is not None else 0.70),
+        information_source=row.get("information_source") or InformationSource.EXPLICIT_STATEMENT.value,
+        persistence_type=row.get("persistence_type") or PersistenceType.PERSISTENT.value,
+        memory_status=row.get("memory_status") or MemoryStatus.ACTIVE.value,
+        reason_for_storage=row.get("reason_for_storage"),
+        valid_from=row.get("valid_from"),
+        valid_until=row.get("valid_until"),
+        last_confirmed_at=row.get("last_confirmed_at"),
+        superseded_by=row.get("superseded_by"),
+        superseded_reason=row.get("superseded_reason"),
         source_message=row["source_message"],
         is_active=row["is_active"],
+        has_embedding=has_emb,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
 
-async def _add_memory_tx(session_id: str, candidate: MemoryCandidate, pool: asyncpg.Pool) -> MemoryRecord:
-    """Internal transaction execution for adding or evolving a memory."""
+async def _add_memory_tx(
+    session_id: str,
+    candidate: MemoryCandidate,
+    pool: asyncpg.Pool,
+    vector_sql: Optional[str] = None
+) -> MemoryRecord:
+    """Internal transaction execution for adding or evolving a memory with its embedding."""
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Automatically expire past-due temporary memories for this session
+            await conn.execute(
+                """
+                UPDATE memories
+                SET is_active = FALSE, memory_status = 'expired', updated_at = NOW()
+                WHERE session_id = $1 AND is_active = TRUE AND valid_until IS NOT NULL AND valid_until <= NOW()
+                """,
+                session_id,
+            )
+
             # Transaction-scoped advisory lock on (session_id, memory_key)
             # perfectly serializes concurrent updates for the same memory key
             lock_id = zlib.crc32(f"{session_id}:{candidate.memory_key}".encode("utf-8"))
@@ -43,6 +83,8 @@ async def _add_memory_tx(session_id: str, candidate: MemoryCandidate, pool: asyn
                 candidate.memory_key,
             )
 
+            new_id = uuid.uuid4()
+
             if existing:
                 existing_content = existing["content"].strip().lower()
                 new_content = candidate.content.strip().lower()
@@ -50,17 +92,26 @@ async def _add_memory_tx(session_id: str, candidate: MemoryCandidate, pool: asyn
                 # Deduplication: equivalent fact
                 if existing_content == new_content:
                     higher_confidence = max(existing["confidence_score"], candidate.confidence_score)
+                    higher_importance = max(
+                        float(existing["importance_score"] if existing["importance_score"] is not None else 0.70),
+                        candidate.importance_score
+                    )
                     updated_row = await conn.fetchrow(
                         """
                         UPDATE memories 
                         SET confidence_score = $1, 
-                            source_message = COALESCE($2, source_message),
+                            importance_score = $2,
+                            source_message = COALESCE($3, source_message),
+                            embedding = COALESCE(embedding, $4::vector),
+                            last_confirmed_at = NOW(),
                             updated_at = NOW()
-                        WHERE id = $3
+                        WHERE id = $5
                         RETURNING *
                         """,
                         higher_confidence,
+                        higher_importance,
                         candidate.source_message,
+                        vector_sql,
                         existing["id"],
                     )
                     logger.info(f"Deduplicated existing memory key '{candidate.memory_key}' for session '{session_id}'.")
@@ -68,37 +119,70 @@ async def _add_memory_tx(session_id: str, candidate: MemoryCandidate, pool: asyn
 
                 # Evolution/Superseding: fact has changed or was corrected
                 logger.info(f"Superseding memory key '{candidate.memory_key}' for session '{session_id}'.")
+                superseded_reason = (
+                    f"Superseded by update: {candidate.content[:120]}"
+                    if candidate.information_source == InformationSource.EXPLICIT_STATEMENT.value
+                    else "Superseded by new contextual observation."
+                )
                 await conn.execute(
                     """
                     UPDATE memories 
-                    SET is_active = FALSE, updated_at = NOW()
-                    WHERE id = $1
+                    SET is_active = FALSE,
+                        memory_status = 'superseded',
+                        superseded_by = $1,
+                        superseded_reason = $2,
+                        updated_at = NOW()
+                    WHERE id = $3
                     """,
+                    new_id,
+                    superseded_reason,
                     existing["id"],
                 )
 
-            # Insert new active memory
+            # Insert new active memory with embedding vector and intelligence metadata
             inserted_row = await conn.fetchrow(
                 """
-                INSERT INTO memories (session_id, category, memory_key, content, confidence_score, source_message, is_active)
-                VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+                INSERT INTO memories (
+                    id, session_id, category, memory_type, memory_key, content, 
+                    confidence_score, importance_score, information_source,
+                    persistence_type, memory_status, reason_for_storage,
+                    valid_from, valid_until, last_confirmed_at,
+                    source_message, is_active, embedding
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, 
+                    $7, $8, $9, 
+                    $10, $11, $12, 
+                    NOW(), $13, NOW(),
+                    $14, TRUE, $15::vector
+                )
                 RETURNING *
                 """,
+                new_id,
                 session_id,
                 candidate.category,
+                candidate.memory_type,
                 candidate.memory_key,
                 candidate.content,
                 candidate.confidence_score,
+                candidate.importance_score,
+                candidate.information_source,
+                candidate.persistence_type,
+                MemoryStatus.ACTIVE.value,
+                candidate.reason_for_storage,
+                candidate.valid_until,
                 candidate.source_message,
+                vector_sql,
             )
             return record_from_row(inserted_row)
 
 async def add_memory(session_id: str, candidate: MemoryCandidate, max_retries: int = 3) -> MemoryRecord:
     """
     Add or evolve a memory record within a session.
+    - Generates vector embedding for candidate content.
     - If equivalent fact exists: updates confidence and timestamp (deduplication).
     - If conflicting/new fact exists for the key: supersedes old active memory in a transaction.
-    - If new key: inserts fresh active memory.
+    - If new key: inserts fresh active memory with embedding vector.
     - Includes automatic retry handling for concurrent insert race conditions.
     """
     pool = await get_db_pool()
@@ -107,9 +191,18 @@ async def add_memory(session_id: str, candidate: MemoryCandidate, max_retries: i
 
     session_id = session_id.strip()
 
+    # Pre-generate embedding vector for the memory content
+    vector_sql: Optional[str] = None
+    try:
+        emb = await generate_embedding(candidate.content)
+        if emb:
+            vector_sql = vector_to_sql_str(emb)
+    except Exception as e:
+        logger.warning(f"Could not generate embedding for memory key '{candidate.memory_key}': {e}")
+
     for attempt in range(max_retries):
         try:
-            return await _add_memory_tx(session_id, candidate, pool)
+            return await _add_memory_tx(session_id, candidate, pool, vector_sql)
         except asyncpg.exceptions.UniqueViolationError:
             if attempt == max_retries - 1:
                 logger.error(f"Concurrency resolution exceeded max retries for key '{candidate.memory_key}'.")
@@ -134,11 +227,23 @@ async def list_memories(
     session_id = session_id.strip()
 
     async with pool.acquire() as conn:
+        # If querying active memories, auto-expire any past-due temporary memories
+        if is_active:
+            await conn.execute(
+                """
+                UPDATE memories
+                SET is_active = FALSE, memory_status = 'expired', updated_at = NOW()
+                WHERE session_id = $1 AND is_active = TRUE AND valid_until IS NOT NULL AND valid_until <= NOW()
+                """,
+                session_id,
+            )
+
         if category:
             rows = await conn.fetch(
                 """
                 SELECT * FROM memories 
                 WHERE session_id = $1 AND category = $2 AND is_active = $3
+                  AND ($3 = FALSE OR valid_until IS NULL OR valid_until > NOW())
                 ORDER BY updated_at DESC
                 """,
                 session_id,
@@ -150,6 +255,7 @@ async def list_memories(
                 """
                 SELECT * FROM memories 
                 WHERE session_id = $1 AND is_active = $2
+                  AND ($2 = FALSE OR valid_until IS NULL OR valid_until > NOW())
                 ORDER BY updated_at DESC
                 """,
                 session_id,
@@ -202,21 +308,69 @@ async def update_memory(
         new_category = category if category is not None else existing["category"]
         new_active = is_active if is_active is not None else existing["is_active"]
 
+        # Regenerate embedding if content changed
+        vector_sql = None
+        if content is not None and content.strip() != existing["content"].strip():
+            try:
+                emb = await generate_embedding(new_content)
+                if emb:
+                    vector_sql = vector_to_sql_str(emb)
+            except Exception as e:
+                logger.warning(f"Failed to regenerate embedding on memory update: {e}")
+
         row = await conn.fetchrow(
             """
             UPDATE memories 
-            SET content = $1, confidence_score = $2, category = $3, is_active = $4, updated_at = NOW()
-            WHERE id = $5 AND session_id = $6
+            SET content = $1, 
+                confidence_score = $2, 
+                category = $3, 
+                is_active = $4, 
+                embedding = COALESCE($5::vector, embedding),
+                updated_at = NOW()
+            WHERE id = $6 AND session_id = $7
             RETURNING *
             """,
             new_content,
             new_confidence,
             new_category,
             new_active,
+            vector_sql,
             memory_id,
             session_id.strip(),
         )
         return record_from_row(row) if row else None
+
+async def backfill_missing_embeddings(session_id: Optional[str] = None) -> int:
+    """Backfill vector embeddings for any active memories currently lacking one."""
+    pool = await get_db_pool()
+    if pool is None:
+        return 0
+
+    async with pool.acquire() as conn:
+        if session_id:
+            rows = await conn.fetch(
+                "SELECT id, content FROM memories WHERE session_id = $1 AND is_active = TRUE AND embedding IS NULL",
+                session_id.strip(),
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT id, content FROM memories WHERE is_active = TRUE AND embedding IS NULL"
+            )
+
+        updated_count = 0
+        for r in rows:
+            emb = await generate_embedding(r["content"])
+            if emb:
+                await conn.execute(
+                    "UPDATE memories SET embedding = $1::vector, updated_at = NOW() WHERE id = $2",
+                    vector_to_sql_str(emb),
+                    r["id"],
+                )
+                updated_count += 1
+
+        if updated_count > 0:
+            logger.info(f"Backfilled {updated_count} missing memory embeddings.")
+        return updated_count
 
 async def delete_memory(session_id: str, memory_id: UUID) -> bool:
     """Delete a specific memory by ID within the user's session."""

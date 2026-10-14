@@ -1,9 +1,9 @@
 import logging
 from typing import List, Tuple, Dict, Any
 from app.config import settings
-from app.schemas import MemoryRecord, MemoryCandidate
+from app.schemas import ScoredMemoryRecord, MemoryCandidate
 from app.services.llm_service import client
-from app.services.memory_retriever import retrieve_relevant_memories
+from app.services.hybrid_retriever import retrieve_hybrid_memories
 from app.services.memory_extractor import extract_memories
 from app.services.memory_service import add_memory
 
@@ -15,7 +15,7 @@ BASE_SYSTEM_INSTRUCTION = (
     "skills, projects, and context across conversations. Give clear, accurate, and deeply personalized responses."
 )
 
-def format_memory_context(memories: List[MemoryRecord]) -> str:
+def format_memory_context(memories: List[ScoredMemoryRecord]) -> str:
     """Format recalled memories into a secure, sandboxed context block."""
     if not memories:
         return ""
@@ -42,22 +42,22 @@ def format_memory_context(memories: List[MemoryRecord]) -> str:
 async def generate_personalized_response(
     message: str,
     session_id: str = "default-session"
-) -> Tuple[str, List[MemoryRecord], List[MemoryCandidate]]:
+) -> Tuple[str, List[ScoredMemoryRecord], List[MemoryCandidate]]:
     """
-    End-to-end personalized conversational flow:
-    1. Retrieve relevant memories for session.
+    End-to-end personalized conversational flow with Hybrid Semantic Retrieval:
+    1. Retrieve relevant memories via Hybrid (Semantic pgvector + Keyword) retriever.
     2. Format sandboxed memory context.
     3. Generate personalized response via NVIDIA Nemotron.
     4. Extract and validate new memory candidates.
-    5. Persist approved memories into PostgreSQL.
+    5. Persist approved memories with embeddings into PostgreSQL.
     """
     session_id = session_id.strip() if session_id else "default-session"
 
-    # 1. Retrieve relevant memories (selective, not every memory)
-    recalled_memories = await retrieve_relevant_memories(
+    # 1. Retrieve relevant memories using Hybrid retrieval
+    recalled_memories = await retrieve_hybrid_memories(
         session_id=session_id,
         query=message,
-        limit=5
+        limit=settings.HYBRID_LIMIT
     )
 
     # 2. Build system prompt with memory context

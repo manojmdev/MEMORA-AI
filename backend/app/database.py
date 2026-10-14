@@ -9,7 +9,9 @@ logger = logging.getLogger(__name__)
 # Global connection pool instance
 _pool: Optional[asyncpg.Pool] = None
 
-CREATE_MEMORIES_TABLE_SQL = """
+CREATE_MEMORIES_TABLE_SQL = f"""
+CREATE EXTENSION IF NOT EXISTS vector;
+
 CREATE TABLE IF NOT EXISTS memories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id VARCHAR(255) NOT NULL,
@@ -23,6 +25,22 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Safe idempotent column addition for pgvector
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector({settings.EMBEDDING_DIMENSION});
+
+-- Safe idempotent column additions for Day 5: Temporal memory and explainability
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_confirmed_at TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS persistence_type VARCHAR(50) DEFAULT 'persistent';
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_status VARCHAR(50) DEFAULT 'active';
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_type VARCHAR(50) DEFAULT 'general_fact';
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS information_source VARCHAR(50) DEFAULT 'explicit_statement';
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS importance_score DOUBLE PRECISION DEFAULT 0.70;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS reason_for_storage TEXT;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_reason TEXT;
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_session_active_memory_key 
 ON memories (session_id, memory_key) 
 WHERE is_active = TRUE;
@@ -30,6 +48,12 @@ WHERE is_active = TRUE;
 CREATE INDEX IF NOT EXISTS idx_memories_session_id ON memories (session_id);
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories (category);
 CREATE INDEX IF NOT EXISTS idx_memories_session_active ON memories (session_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_memories_status_valid ON memories (session_id, memory_status, is_active);
+
+-- HNSW cosine distance index for sub-millisecond semantic similarity search
+CREATE INDEX IF NOT EXISTS idx_memories_embedding 
+ON memories USING hnsw (embedding vector_cosine_ops) 
+WHERE is_active = TRUE;
 """
 
 def get_clean_dsn(raw_url: str) -> str:

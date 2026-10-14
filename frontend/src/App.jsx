@@ -165,7 +165,7 @@ function App() {
 
           <div className="connection">
             <span className="status-dot"></span>
-            <span>Neon + Nemotron</span>
+            <span>Neon pgvector + Nemotron</span>
           </div>
         </div>
       </header>
@@ -218,13 +218,37 @@ function App() {
                     <p>{msg.content}</p>
 
                     {msg.recalled && msg.recalled.length > 0 && (
-                      <div className="memory-chips">
-                        <small className="chips-title">Recalled Context:</small>
-                        {msg.recalled.map((rec, i) => (
-                          <span key={i} className="chip recalled" title={rec.content}>
-                            💡 {rec.memory_key}
-                          </span>
-                        ))}
+                      <div className="memories-used-panel">
+                        <div className="memories-used-header">
+                          <Sparkles size={12} className="sparkle-icon" />
+                          <span>MEMORIES USED</span>
+                          <span className="count-badge">{msg.recalled.length}</span>
+                        </div>
+                        <div className="memories-used-list">
+                          {msg.recalled.map((rec, i) => (
+                            <div key={i} className="memory-used-item">
+                              <div className="used-item-top">
+                                <span className={`method-badge method-${rec.retrieval_method || "keyword"}`}>
+                                  {rec.retrieval_method === "hybrid" && "✨ Hybrid"}
+                                  {rec.retrieval_method === "semantic" && "🧠 Semantic"}
+                                  {rec.retrieval_method === "keyword" && "🔍 Keyword"}
+                                </span>
+                                <span className="used-key">#{rec.memory_key}</span>
+                                {rec.similarity_score !== undefined && (
+                                  <span className="score-badge" title="Retriever similarity score">
+                                    {Math.round(rec.similarity_score * 100)}% match
+                                  </span>
+                                )}
+                              </div>
+                              <p className="used-content">{rec.content}</p>
+                              {rec.retrieval_reason && (
+                                <div className="used-reason">
+                                  <span className="reason-label">Why retrieved:</span> {rec.retrieval_reason}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
                       </div>
                     )}
 
@@ -322,11 +346,19 @@ function App() {
                   filteredMemories.map((m) => (
                     <div className="memory-card" key={m.id}>
                       <div className="card-top">
-                        <span className={`cat-badge cat-${m.category.toLowerCase()}`}>
-                          <Tag size={10} /> {m.category}
-                        </span>
+                        <div className="card-top-tags">
+                          <span className={`cat-badge cat-${m.category.toLowerCase()}`}>
+                            <Tag size={10} /> {m.category}
+                          </span>
+                          <span className={`badge-pill ${m.persistence_type === "temporary" ? "badge-temporary" : "badge-persistent"}`}>
+                            {m.persistence_type === "temporary" ? "⏳ Temporary" : "📌 Persistent"}
+                          </span>
+                          <span className={`badge-pill ${m.information_source === "contextual_inference" ? "badge-source-inferred" : "badge-source-explicit"}`}>
+                            {m.information_source === "contextual_inference" ? "Inferred" : "Explicit"}
+                          </span>
+                        </div>
                         <div className="card-meta">
-                          <span className="confidence-badge">
+                          <span className="confidence-badge" title="Confidence score">
                             {Math.round(m.confidence_score * 100)}%
                           </span>
                           <button
@@ -338,8 +370,16 @@ function App() {
                           </button>
                         </div>
                       </div>
-                      <div className="card-key">#{m.memory_key}</div>
+                      <div className="card-key">
+                        #{m.memory_key}
+                        {m.has_embedding && <span className="vector-badge" title="Vector embedded in Neon pgvector">⚡ pgvector</span>}
+                      </div>
                       <p className="card-content">{m.content}</p>
+                      {m.reason_for_storage && (
+                        <div className="card-reason" title="Reason for storage">
+                          💡 <small>{m.reason_for_storage}</small>
+                        </div>
+                      )}
                     </div>
                   ))
                 )}
