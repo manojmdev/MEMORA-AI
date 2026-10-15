@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     KEYWORD_WEIGHT: float = 0.50
     SEMANTIC_WEIGHT: float = 0.50
     HYBRID_LIMIT: int = 5
+    # Day 7: Environment & Production Safety Gates
+    ENVIRONMENT: str = "development"
+    ENABLE_EVALUATION_ENDPOINT: bool = False
 
     model_config = SettingsConfigDict(
         env_file=(str(ENV_FILE), ".env", str(Path(__file__).resolve().parent.parent.parent / ".env.local")),

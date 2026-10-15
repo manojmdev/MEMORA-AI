@@ -357,8 +357,9 @@ class AgentOrchestrator:
                     logger.warning(f"Could not deserialize plan_json: {e}")
 
             # Reconstruct pending approval if still awaiting
+            # Reconstruct pending approval if still awaiting
             pending_req = None
-            if row["status"] == TaskStatus.AWAITING_APPROVAL.value and row["approval_token"]:
+            if row["status"] == TaskStatus.AWAITING_APPROVAL.value:
                 if plan_obj:
                     for s in plan_obj.steps:
                         if s.status == StepStatus.AWAITING_APPROVAL:
@@ -368,7 +369,8 @@ class AgentOrchestrator:
                                 tool_name=s.tool_name or "create_note",
                                 arguments=s.arguments
                             )
-                            pending_req.approval_token = row["approval_token"]
+                            # Never expose token from historical queries
+                            pending_req.approval_token = "[REDACTED_HISTORICAL_TOKEN]"
                             if row["approval_expires_at"]:
                                 pending_req.expires_at = row["approval_expires_at"]
                             break
@@ -381,7 +383,7 @@ class AgentOrchestrator:
                 plan=plan_obj,
                 status=TaskStatus(row["status"]),
                 result_summary=row["result_summary"],
-                approval_token=row["approval_token"],
+                approval_token=None,
                 approval_status=row["approval_status"],
                 approval_expires_at=row["approval_expires_at"],
                 pending_approval=pending_req,
@@ -391,7 +393,7 @@ class AgentOrchestrator:
             )
 
     async def list_tasks(self, session_id: str, limit: int = 20) -> List[AgentTask]:
-        """List tasks belonging to current session."""
+        """List tasks belonging to current session with sensitive tokens redacted."""
         pool = await get_db_pool()
         if pool is None:
             return []
@@ -429,7 +431,7 @@ class AgentOrchestrator:
                         plan=plan_obj,
                         status=TaskStatus(r["status"]),
                         result_summary=r["result_summary"],
-                        approval_token=r["approval_token"],
+                        approval_token=None,
                         approval_status=r["approval_status"],
                         approval_expires_at=r["approval_expires_at"],
                         created_at=r["created_at"],
@@ -500,7 +502,7 @@ class AgentOrchestrator:
                 plan_json_str,
                 task.status.value,
                 task.result_summary,
-                task.approval_token,
+                None,
                 task.approval_status,
                 task.approval_expires_at,
                 task.created_at,
@@ -523,17 +525,15 @@ class AgentOrchestrator:
                 SET plan_json = $1::jsonb,
                     status = $2,
                     result_summary = $3,
-                    approval_token = $4,
-                    approval_status = $5,
-                    approval_expires_at = $6,
+                    approval_status = $4,
+                    approval_expires_at = $5,
                     updated_at = NOW(),
-                    completed_at = $7
-                WHERE id = $8 AND session_id = $9
+                    completed_at = $6
+                WHERE id = $7 AND session_id = $8
                 """,
                 plan_json_str,
                 task.status.value,
                 task.result_summary,
-                task.approval_token,
                 task.approval_status,
                 task.approval_expires_at,
                 task.completed_at,

@@ -1,8 +1,10 @@
 """
 MEMORA AI — Safe Arithmetic Calculator Tool
 Evaluates mathematical expressions using Python's AST parser with zero eval, exec, or shell execution.
+Hardened against resource exhaustion, deep nesting, overflow, and non-finite values.
 """
 import ast
+import math
 import operator
 import logging
 import re
@@ -11,6 +13,12 @@ from app.agent.models import ToolPermission
 from app.agent.tools.base import BaseTool
 
 logger = logging.getLogger(__name__)
+
+MAX_EXPRESSION_LENGTH = 150
+MAX_AST_DEPTH = 8
+MAX_AST_NODES = 40
+MAX_DIGITS_PER_LITERAL = 40
+MAX_RESULT_MAGNITUDE = 1e15
 
 SAFE_OPERATORS = {
     ast.Add: operator.add,
@@ -24,14 +32,27 @@ SAFE_OPERATORS = {
     ast.UAdd: operator.pos,
 }
 
+def _validate_ast_limits(node: ast.AST, current_depth: int = 1) -> int:
+    """Validate that the AST does not exceed recursion depth or total node complexity limits."""
+    if current_depth > MAX_AST_DEPTH:
+        raise ValueError(f"Expression exceeds maximum allowed nesting depth of {MAX_AST_DEPTH}.")
+    node_count = 1
+    for child in ast.iter_child_nodes(node):
+        node_count += _validate_ast_limits(child, current_depth + 1)
+    if node_count > MAX_AST_NODES:
+        raise ValueError(f"Expression exceeds maximum allowed complexity ({MAX_AST_NODES} AST nodes).")
+    return node_count
+
 def _eval_ast(node: ast.AST) -> Union[int, float]:
-    """Recursively evaluate an AST expression with strict node type allowlisting."""
+    """Recursively evaluate an AST expression with strict node type allowlisting and resource limits."""
     if isinstance(node, ast.Expression):
         return _eval_ast(node.body)
     elif isinstance(node, ast.Constant):
-        if isinstance(node.value, (int, float)):
-            return node.value
-        raise ValueError(f"Unsupported constant type: {type(node.value)}")
+        if not isinstance(node.value, (int, float)):
+            raise ValueError(f"Unsupported constant type: {type(node.value).__name__}")
+        if isinstance(node.value, int) and len(str(abs(node.value))) > MAX_DIGITS_PER_LITERAL:
+            raise ValueError(f"Integer literal exceeds maximum allowed size of {MAX_DIGITS_PER_LITERAL} digits.")
+        return node.value
     elif isinstance(node, ast.BinOp):
         left = _eval_ast(node.left)
         right = _eval_ast(node.right)
@@ -39,15 +60,28 @@ def _eval_ast(node: ast.AST) -> Union[int, float]:
         if op_type not in SAFE_OPERATORS:
             raise ValueError(f"Disallowed operator: {op_type.__name__}")
 
-        # Power protection against CPU exhaustion (e.g. 2**10000000)
+        # Power protection against CPU exhaustion and complex outputs
         if op_type is ast.Pow:
-            if abs(right) > 100 or abs(left) > 10000:
+            if left < 0 and isinstance(right, float) and not right.is_integer():
+                raise ValueError("Fractional powers of negative numbers produce complex results and are disallowed.")
+            if abs(right) > 50 or abs(left) > 10000:
                 raise ValueError("Exponent or base is excessively large for safe evaluation.")
 
         if op_type in (ast.Div, ast.FloorDiv, ast.Mod) and right == 0:
             raise ZeroDivisionError("Division by zero is undefined.")
 
-        return SAFE_OPERATORS[op_type](left, right)
+        try:
+            res = SAFE_OPERATORS[op_type](left, right)
+        except OverflowError:
+            raise ValueError("Calculation resulted in numerical overflow.")
+
+        if isinstance(res, (int, float)):
+            if not math.isfinite(res):
+                raise ValueError("Calculation produced a non-finite result (infinity or NaN).")
+            if abs(res) > MAX_RESULT_MAGNITUDE:
+                raise ValueError("Calculation result exceeds maximum allowed magnitude (1e15).")
+        return res
+
     elif isinstance(node, ast.UnaryOp):
         operand = _eval_ast(node.operand)
         op_type = type(node.op)
@@ -87,12 +121,12 @@ class CalculatorTool(BaseTool):
         # Strip trailing explanation clauses (e.g. 'to find...')
         clean_expr = re.sub(r"\s+to\s+(?:find|calculate|get|determine|estimate).*", "", clean_expr, flags=re.IGNORECASE).strip()
 
-        if len(clean_expr) > 200:
-            raise ValueError("Expression exceeds maximum allowed length of 200 characters.")
-
+        if len(clean_expr) > MAX_EXPRESSION_LENGTH:
+            raise ValueError(f"Expression exceeds maximum allowed length of {MAX_EXPRESSION_LENGTH} characters.")
 
         try:
             parsed = ast.parse(clean_expr, mode="eval")
+            _validate_ast_limits(parsed)
             result = _eval_ast(parsed)
             # Normalize float if integer
             if isinstance(result, float) and result.is_integer():

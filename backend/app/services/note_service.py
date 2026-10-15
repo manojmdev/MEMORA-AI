@@ -24,12 +24,33 @@ async def create_note(session_id: str, title: str, content: str) -> Dict[str, An
     clean_content = content.strip()
 
     async with pool.acquire() as conn:
-        # Check idempotency: avoid inserting identical note in same session
+        # Atomic insert with ON CONFLICT DO NOTHING to prevent concurrent race conditions
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO notes (session_id, title, content)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (session_id, md5(title), md5(content)) DO NOTHING
+                RETURNING id, session_id, title, content, created_at, updated_at
+                """,
+                clean_session,
+                clean_title,
+                clean_content,
+            )
+            if row:
+                logger.info(f"Created persistent note '{row['id']}' for session '{clean_session}'.")
+                return dict(row)
+        except Exception as e:
+            logger.debug(f"Conflict or constraint check on note creation: {e}")
+
+        # If conflict occurred, retrieve existing record
         existing = await conn.fetchrow(
             """
             SELECT id, session_id, title, content, created_at, updated_at
             FROM notes
             WHERE session_id = $1 AND title = $2 AND content = $3
+            ORDER BY created_at ASC
+            LIMIT 1
             """,
             clean_session,
             clean_title,
@@ -38,19 +59,7 @@ async def create_note(session_id: str, title: str, content: str) -> Dict[str, An
         if existing:
             logger.info(f"Idempotent match: note already exists for session '{clean_session}'.")
             return dict(existing)
-
-        row = await conn.fetchrow(
-            """
-            INSERT INTO notes (session_id, title, content)
-            VALUES ($1, $2, $3)
-            RETURNING id, session_id, title, content, created_at, updated_at
-            """,
-            clean_session,
-            clean_title,
-            clean_content,
-        )
-        logger.info(f"Created persistent note '{row['id']}' for session '{clean_session}'.")
-        return dict(row)
+        raise RuntimeError("Failed to create or retrieve persistent note.")
 
 async def get_note(session_id: str, note_id: UUID) -> Optional[Dict[str, Any]]:
     """Retrieve a note by ID, strictly enforcing session isolation."""

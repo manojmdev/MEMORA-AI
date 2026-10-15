@@ -66,6 +66,9 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notes_session_id ON notes (session_id);
+-- Day 7: Idempotent uniqueness index for notes using MD5 hash of text to prevent B-tree row limit issues
+CREATE UNIQUE INDEX IF NOT EXISTS uq_notes_session_title_content 
+ON notes (session_id, md5(title), md5(content));
 
 CREATE TABLE IF NOT EXISTS agent_tasks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -83,8 +86,12 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     completed_at TIMESTAMPTZ
 );
 
+-- Day 7: Idempotent column addition for secure approval token hashing
+ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS approval_token_hash VARCHAR(64);
+
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_session_id ON agent_tasks (session_id);
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_status ON agent_tasks (status);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_token_hash ON agent_tasks (approval_token_hash) WHERE approval_token_hash IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS agent_execution_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -190,5 +197,34 @@ async def check_db_health() -> Dict[str, Any]:
         logger.error(f"Database health check failed: {e}")
         return {
             "status": "unhealthy",
-            "error": str(e)
+            "error": "Database connectivity check failed"
         }
+
+async def recover_interrupted_tasks() -> int:
+    """
+    Day 7: Sweep tasks left in 'running' status across restarts or abnormal termination.
+    Transitions stale running tasks to 'failed' to prevent hanging states.
+    """
+    pool = await get_db_pool()
+    if pool is None:
+        return 0
+
+    try:
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE agent_tasks
+                SET status = 'failed',
+                    result_summary = 'Task execution interrupted by server restart or unexpected shutdown.',
+                    completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE status = 'running'
+                """
+            )
+            count = int(result.split()[-1]) if result else 0
+            if count > 0:
+                logger.info(f"Recovered {count} interrupted agent tasks on startup.")
+            return count
+    except Exception as e:
+        logger.error(f"Failed to recover interrupted tasks: {e}")
+        return 0

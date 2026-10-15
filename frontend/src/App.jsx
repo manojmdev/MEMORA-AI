@@ -773,34 +773,38 @@ function App() {
                         </div>
                       </div>
 
-                      <div className="approval-actions-bar">
-                        <button
-                          className="approve-btn"
-                          onClick={() =>
-                            handleApproveTask(
-                              activeTask.id,
-                              activeTask.approval_token || activeTask.pending_approval.approval_token
-                            )
-                          }
-                          disabled={actionLoading}
-                        >
-                          <Check size={16} />
-                          {actionLoading ? "Processing Approval..." : "Approve & Execute"}
-                        </button>
-                        <button
-                          className="reject-btn"
-                          onClick={() =>
-                            handleRejectTask(
-                              activeTask.id,
-                              activeTask.approval_token || activeTask.pending_approval.approval_token
-                            )
-                          }
-                          disabled={actionLoading}
-                        >
-                          <XCircle size={16} />
-                          {actionLoading ? "Rejecting..." : "Reject & Cancel"}
-                        </button>
-                      </div>
+                      {(() => {
+                        const token = activeTask.approval_token || activeTask.pending_approval?.approval_token;
+                        const hasToken = token && !token.includes("[REDACTED");
+                        return (
+                          <>
+                            {!hasToken && (
+                              <div className="historical-token-notice" style={{ padding: "0.75rem 1rem", background: "rgba(234, 179, 8, 0.1)", border: "1px solid rgba(234, 179, 8, 0.3)", borderRadius: "8px", marginBottom: "0.75rem", fontSize: "0.82rem", color: "#eab308" }}>
+                                ℹ️ This task was reloaded from session history. In accordance with zero-knowledge token security, approval tokens are never stored or exposed in task history. Please re-run the task to generate a fresh approval token.
+                              </div>
+                            )}
+                            <div className="approval-actions-bar">
+                              <button
+                                className="approve-btn"
+                                onClick={() => handleApproveTask(activeTask.id, token)}
+                                disabled={actionLoading || !hasToken}
+                                title={!hasToken ? "Approval tokens are not retained in history for security" : "Approve and execute"}
+                              >
+                                <Check size={16} />
+                                {actionLoading ? "Processing Approval..." : "Approve & Execute"}
+                              </button>
+                              <button
+                                className="reject-btn"
+                                onClick={() => handleRejectTask(activeTask.id, token)}
+                                disabled={actionLoading}
+                              >
+                                <XCircle size={16} />
+                                {actionLoading ? "Rejecting..." : "Reject & Cancel"}
+                              </button>
+                            </div>
+                          </>
+                        );
+                      })()}
                     </div>
                   )}
 
