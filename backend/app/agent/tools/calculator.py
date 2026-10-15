@@ -48,10 +48,22 @@ def _eval_ast(node: ast.AST) -> Union[int, float]:
     if isinstance(node, ast.Expression):
         return _eval_ast(node.body)
     elif isinstance(node, ast.Constant):
+        # Reject booleans (in Python, bool is an instance of int)
+        if isinstance(node.value, bool):
+            raise ValueError("Boolean literals are disallowed in arithmetic.")
         if not isinstance(node.value, (int, float)):
             raise ValueError(f"Unsupported constant type: {type(node.value).__name__}")
-        if isinstance(node.value, int) and len(str(abs(node.value))) > MAX_DIGITS_PER_LITERAL:
-            raise ValueError(f"Integer literal exceeds maximum allowed size of {MAX_DIGITS_PER_LITERAL} digits.")
+
+        if isinstance(node.value, float):
+            if not math.isfinite(node.value):
+                raise ValueError("Non-finite float constants (NaN or Infinity) are disallowed.")
+            if abs(node.value) > MAX_RESULT_MAGNITUDE:
+                raise ValueError(f"Float literal exceeds maximum allowed magnitude ({MAX_RESULT_MAGNITUDE}).")
+        elif isinstance(node.value, int):
+            if len(str(abs(node.value))) > MAX_DIGITS_PER_LITERAL:
+                raise ValueError(f"Integer literal exceeds maximum allowed size of {MAX_DIGITS_PER_LITERAL} digits.")
+            if abs(node.value) > MAX_RESULT_MAGNITUDE:
+                raise ValueError(f"Integer literal exceeds maximum allowed magnitude ({MAX_RESULT_MAGNITUDE}).")
         return node.value
     elif isinstance(node, ast.BinOp):
         left = _eval_ast(node.left)
@@ -75,11 +87,13 @@ def _eval_ast(node: ast.AST) -> Union[int, float]:
         except OverflowError:
             raise ValueError("Calculation resulted in numerical overflow.")
 
-        if isinstance(res, (int, float)):
-            if not math.isfinite(res):
-                raise ValueError("Calculation produced a non-finite result (infinity or NaN).")
-            if abs(res) > MAX_RESULT_MAGNITUDE:
-                raise ValueError("Calculation result exceeds maximum allowed magnitude (1e15).")
+        if not isinstance(res, (int, float)) or isinstance(res, bool):
+            raise ValueError(f"Calculation produced an invalid result type: {type(res).__name__}")
+
+        if not math.isfinite(res):
+            raise ValueError("Calculation produced a non-finite result (infinity or NaN).")
+        if abs(res) > MAX_RESULT_MAGNITUDE:
+            raise ValueError("Calculation result exceeds maximum allowed magnitude (1e15).")
         return res
 
     elif isinstance(node, ast.UnaryOp):
@@ -87,7 +101,18 @@ def _eval_ast(node: ast.AST) -> Union[int, float]:
         op_type = type(node.op)
         if op_type not in SAFE_OPERATORS:
             raise ValueError(f"Disallowed unary operator: {op_type.__name__}")
-        return SAFE_OPERATORS[op_type](operand)
+        try:
+            res = SAFE_OPERATORS[op_type](operand)
+        except OverflowError:
+            raise ValueError("Unary calculation resulted in numerical overflow.")
+
+        if not isinstance(res, (int, float)) or isinstance(res, bool):
+            raise ValueError(f"Unary calculation produced an invalid result type: {type(res).__name__}")
+        if not math.isfinite(res):
+            raise ValueError("Unary calculation produced a non-finite result (infinity or NaN).")
+        if abs(res) > MAX_RESULT_MAGNITUDE:
+            raise ValueError("Unary calculation result exceeds maximum allowed magnitude (1e15).")
+        return res
     else:
         raise ValueError(f"Disallowed expression node: {type(node).__name__}")
 

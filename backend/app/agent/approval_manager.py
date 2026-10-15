@@ -143,15 +143,12 @@ async def validate_and_consume_approval(
                 )
                 return False, "Approval token has expired."
 
-            # Verify token via SHA-256 hash or legacy plaintext comparison
-            token_valid = False
-            provided_hash = hash_token(approval_token)
-            if row["approval_token_hash"]:
-                token_valid = secrets.compare_digest(row["approval_token_hash"], provided_hash)
-            elif row["approval_token"]:
-                token_valid = secrets.compare_digest(row["approval_token"], approval_token)
+            # Verify token via SHA-256 hash (legacy plaintext fallback strictly removed)
+            if not row["approval_token_hash"]:
+                return False, "Approval token hash is missing or legacy record invalidated."
 
-            if not token_valid:
+            provided_hash = hash_token(approval_token)
+            if not secrets.compare_digest(row["approval_token_hash"], provided_hash):
                 return False, "Invalid approval token."
 
             # Atomically mark consumed/approved
@@ -167,28 +164,33 @@ async def validate_and_consume_approval(
                 task_id,
             )
 
-            # Record audit event
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO agent_execution_logs (
-                        task_id, session_id, step_id, tool_name, arguments_json,
-                        status, approval_status, result_summary, duration_ms
-                    )
-                    VALUES ($1, $2, 'approval_gate', 'approval_manager', '{"action": "approve"}'::jsonb,
-                            'succeeded', $3, 'Approval granted and consumed atomically.', 0)
-                    """,
-                    task_id,
-                    session_id.strip(),
-                    ApprovalStatus.APPROVED.value,
+            # Record audit event atomically within the same transaction (failures roll back approval consumption)
+            await conn.execute(
+                """
+                INSERT INTO agent_execution_logs (
+                    task_id, session_id, step_id, tool_name, arguments_json,
+                    status, approval_status, result_summary, duration_ms
                 )
-            except Exception as log_err:
-                logger.warning(f"Failed to record approval audit log: {log_err}")
+                VALUES ($1, $2, 'approval_gate', 'approval_manager', '{"action": "approve"}'::jsonb,
+                        'succeeded', $3, 'Approval granted and consumed atomically.', 0)
+                """,
+                task_id,
+                session_id.strip(),
+                ApprovalStatus.APPROVED.value,
+            )
 
             return True, None
 
 async def reject_approval(task_id: UUID, session_id: str) -> Tuple[bool, Optional[str]]:
-    """Explicitly reject pending approval atomically and transition task to CANCELLED."""
+    """
+    Explicitly reject pending approval atomically and transition task to CANCELLED.
+    Enforces state machine rules:
+    - Task must exist and be owned by the session
+    - Task must be in status AWAITING_APPROVAL
+    - Approval status must be PENDING
+    - Approval must not be expired
+    - Transactional audit log insertion (failures roll back rejection)
+    """
     pool = await get_db_pool()
     if pool is None:
         return False, "Database pool is unavailable."
@@ -197,7 +199,7 @@ async def reject_approval(task_id: UUID, session_id: str) -> Tuple[bool, Optiona
         async with conn.transaction():
             row = await conn.fetchrow(
                 """
-                SELECT id, status, approval_status
+                SELECT id, session_id, status, approval_status, approval_expires_at
                 FROM agent_tasks
                 WHERE id = $1 AND session_id = $2
                 FOR UPDATE
@@ -208,12 +210,38 @@ async def reject_approval(task_id: UUID, session_id: str) -> Tuple[bool, Optiona
             if not row:
                 return False, "Task not found or access denied."
 
+            # State machine validations
+            if row["status"] != TaskStatus.AWAITING_APPROVAL.value:
+                return False, f"Cannot reject task in status '{row['status']}'; task is not awaiting approval."
+
+            if row["approval_status"] != ApprovalStatus.PENDING.value:
+                return False, f"Cannot reject approval in status '{row['approval_status']}'; only pending approvals can be rejected."
+
+            # Expiration check
+            now = datetime.now(timezone.utc)
+            if row["approval_expires_at"] and row["approval_expires_at"] < now:
+                await conn.execute(
+                    """
+                    UPDATE agent_tasks
+                    SET approval_status = $1,
+                        status = $2,
+                        result_summary = 'Approval request expired before rejection.',
+                        updated_at = NOW()
+                    WHERE id = $3
+                    """,
+                    ApprovalStatus.EXPIRED.value,
+                    TaskStatus.FAILED.value,
+                    task_id,
+                )
+                return False, "Approval request has expired."
+
             await conn.execute(
                 """
                 UPDATE agent_tasks
                 SET status = $1,
                     approval_status = $2,
                     approval_token = NULL,
+                    approval_token_hash = NULL,
                     result_summary = 'User rejected the requested operation.',
                     completed_at = NOW(),
                     updated_at = NOW()
@@ -224,23 +252,20 @@ async def reject_approval(task_id: UUID, session_id: str) -> Tuple[bool, Optiona
                 task_id,
             )
 
-            # Record audit event
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO agent_execution_logs (
-                        task_id, session_id, step_id, tool_name, arguments_json,
-                        status, approval_status, result_summary, duration_ms
-                    )
-                    VALUES ($1, $2, 'approval_gate', 'approval_manager', '{"action": "reject"}'::jsonb,
-                            'cancelled', $3, 'Operation declined by user.', 0)
-                    """,
-                    task_id,
-                    session_id.strip(),
-                    ApprovalStatus.REJECTED.value,
+            # Record audit event atomically within the transaction (failures roll back rejection)
+            await conn.execute(
+                """
+                INSERT INTO agent_execution_logs (
+                    task_id, session_id, step_id, tool_name, arguments_json,
+                    status, approval_status, result_summary, duration_ms
                 )
-            except Exception as log_err:
-                logger.warning(f"Failed to record rejection audit log: {log_err}")
+                VALUES ($1, $2, 'approval_gate', 'approval_manager', '{"action": "reject"}'::jsonb,
+                        'cancelled', $3, 'Operation declined by user.', 0)
+                """,
+                task_id,
+                session_id.strip(),
+                ApprovalStatus.REJECTED.value,
+            )
 
             logger.info(f"Task '{task_id}' approval rejected by user; status marked CANCELLED.")
             return True, None

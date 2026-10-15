@@ -43,6 +43,7 @@ from app.agent.policy_engine import policy_engine
 from app.agent.plan_validator import validate_and_govern_plan
 from app.agent.approval_manager import (
     generate_approval_token,
+    hash_token,
     validate_and_consume_approval,
     reject_approval,
     is_token_expired
@@ -209,12 +210,12 @@ async def run_day6_agent_tests():
         async with pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO agent_tasks (id, session_id, user_request, task_type, status, approval_token, approval_status, approval_expires_at)
-                VALUES ($1, $2, 'test approval', 'write', 'awaiting_approval', $3, 'pending', $4)
+                INSERT INTO agent_tasks (id, session_id, user_request, task_type, status, approval_token, approval_token_hash, approval_status, approval_expires_at)
+                VALUES ($1, $2, 'test approval', 'write', 'awaiting_approval', NULL, $3, 'pending', $4)
                 """,
                 test_task_id,
                 session_alpha,
-                token,
+                hash_token(token),
                 future_dt,
             )
 

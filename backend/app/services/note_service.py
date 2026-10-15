@@ -24,26 +24,24 @@ async def create_note(session_id: str, title: str, content: str) -> Dict[str, An
     clean_content = content.strip()
 
     async with pool.acquire() as conn:
-        # Atomic insert with ON CONFLICT DO NOTHING to prevent concurrent race conditions
-        try:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO notes (session_id, title, content)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (session_id, md5(title), md5(content)) DO NOTHING
-                RETURNING id, session_id, title, content, created_at, updated_at
-                """,
-                clean_session,
-                clean_title,
-                clean_content,
-            )
-            if row:
-                logger.info(f"Created persistent note '{row['id']}' for session '{clean_session}'.")
-                return dict(row)
-        except Exception as e:
-            logger.debug(f"Conflict or constraint check on note creation: {e}")
+        # Atomic insert with ON CONFLICT DO NOTHING to prevent duplicate race conditions
+        # If a conflict occurs, PostgreSQL returns no row (row is None) without raising an exception
+        row = await conn.fetchrow(
+            """
+            INSERT INTO notes (session_id, title, content)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (session_id, md5(title), md5(content)) DO NOTHING
+            RETURNING id, session_id, title, content, created_at, updated_at
+            """,
+            clean_session,
+            clean_title,
+            clean_content,
+        )
+        if row:
+            logger.info(f"Created persistent note '{row['id']}' for session '{clean_session}'.")
+            return dict(row)
 
-        # If conflict occurred, retrieve existing record
+        # If row is None, ON CONFLICT triggered because the note already exists; retrieve existing
         existing = await conn.fetchrow(
             """
             SELECT id, session_id, title, content, created_at, updated_at

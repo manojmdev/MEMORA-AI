@@ -46,7 +46,12 @@ from app.agent.approval_manager import (
 from app.agent.orchestrator import agent_orchestrator
 from app.agent.tools.calculator import CalculatorTool
 from app.services import note_service
-from app.auth.session_guard import validate_session_id
+from app.auth.session_guard import (
+    validate_session_id,
+    validate_session_format,
+    verify_session_ownership,
+    UserPrincipal
+)
 from app.main import app
 import httpx
 from fastapi import HTTPException
@@ -202,18 +207,18 @@ async def run_day7_hardening_tests():
     # Valid sessions
     assert validate_session_id("my-session_123") == "my-session_123"
     assert validate_session_id("abc") == "abc"
+    assert validate_session_format("my-session_123") == "my-session_123"
 
-    # Invalid session formats
-    for bad_sid in ["", "  ", "ab", "bad session with spaces", "bad/slash", "a" * 150, "<script>"]:
+    # Invalid session formats: every single one must raise 400 without skipping!
+    bad_sessions = ["", "  ", "ab", "bad session with spaces", "bad/slash", "a" * 150, "<script>"]
+    for bad_sid in bad_sessions:
         try:
-            # When empty in development it defaults to default-session; but non-empty invalid format raises 400
-            if bad_sid.strip() and not ("a" <= bad_sid[0] <= "z" and len(bad_sid) >= 3):
-                validate_session_id(bad_sid)
-                assert False, f"Expected 400 for bad session_id: {bad_sid}"
+            validate_session_format(bad_sid)
+            assert False, f"Expected 400 for bad session format: '{bad_sid}'"
         except HTTPException as e:
-            assert e.status_code == 400, f"Expected 400 status code, got {e.status_code}"
+            assert e.status_code == 400, f"Expected 400 for '{bad_sid}', got {e.status_code}"
 
-    # Production mode refusal of default-session
+    # Production mode refusal of default-session and unauthenticated access
     original_env = settings.ENVIRONMENT
     try:
         settings.ENVIRONMENT = "production"
@@ -228,10 +233,42 @@ async def run_day7_hardening_tests():
             assert False, "None session must be rejected in production"
         except HTTPException as e:
             assert e.status_code == 400, f"Expected 400 for missing session in production, got {e.status_code}"
+
+        try:
+            validate_session_id("")
+            assert False, "Empty session must be rejected in production"
+        except HTTPException as e:
+            assert e.status_code == 400, f"Expected 400 for empty session in production, got {e.status_code}"
+
+        # Principal ownership in production
+        anon_principal = UserPrincipal(
+            user_id="anon",
+            is_authenticated=False,
+            allowed_sessions=set(),
+            is_demo_mode=False
+        )
+        try:
+            verify_session_ownership("prod-user-session", anon_principal)
+            assert False, "Unauthenticated principal must be rejected in production"
+        except HTTPException as e:
+            assert e.status_code == 401, f"Expected 401 for unauthenticated in production, got {e.status_code}"
+
+        auth_principal = UserPrincipal(
+            user_id="user_prod_1",
+            is_authenticated=True,
+            allowed_sessions={"prod-user-session"},
+            is_demo_mode=False
+        )
+        assert verify_session_ownership("prod-user-session", auth_principal) == "prod-user-session"
+        try:
+            verify_session_ownership("foreign-user-session", auth_principal)
+            assert False, "Mismatched session must be rejected with 403"
+        except HTTPException as e:
+            assert e.status_code == 403, f"Expected 403 for mismatched session, got {e.status_code}"
     finally:
         settings.ENVIRONMENT = original_env
 
-    print("  [✓] Session identifier validation and production 'default-session' lockout enforced.")
+    print("  [✓] Strict session format validation, production lockout, and principal ownership verified.")
 
     # =========================================================================
     # TEST 6: Correlation ID Middleware & Sanitized Public Errors / Health
@@ -275,29 +312,45 @@ async def run_day7_hardening_tests():
     print("  [✓] Evaluation run endpoint strictly blocked in production.")
 
     # =========================================================================
-    # TEST 8: Interrupted Task Startup Recovery Sweep
+    # TEST 8: Interrupted Task Startup Recovery Sweep & Active Lease Preservation
     # =========================================================================
-    print("\n--- [TEST 8] Interrupted Task Startup Recovery Sweep ---")
+    print("\n--- [TEST 8] Interrupted Task Startup Recovery Sweep & Active Lease Preservation ---")
     stale_task_id = uuid.uuid4()
+    active_task_id = uuid.uuid4()
     async with pool.acquire() as conn:
+        # 1. Stale task whose execution lease expired 10 minutes ago
         await conn.execute(
             """
-            INSERT INTO agent_tasks (id, session_id, user_request, status, plan_json, created_at, updated_at)
-            VALUES ($1, $2, 'Interrupted job', $3, '{}'::jsonb, NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '30 minutes')
+            INSERT INTO agent_tasks (id, session_id, user_request, status, plan_json, execution_lease_expires_at, created_at, updated_at)
+            VALUES ($1, $2, 'Interrupted stale job', $3, '{}'::jsonb, NOW() - INTERVAL '10 minutes', NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '30 minutes')
             """,
             stale_task_id,
             test_session,
             TaskStatus.RUNNING.value
         )
+        # 2. Active running task whose execution lease is valid for the next 5 minutes
+        await conn.execute(
+            """
+            INSERT INTO agent_tasks (id, session_id, user_request, status, plan_json, execution_lease_expires_at, created_at, updated_at)
+            VALUES ($1, $2, 'Active running job', $3, '{}'::jsonb, NOW() + INTERVAL '5 minutes', NOW(), NOW())
+            """,
+            active_task_id,
+            test_session,
+            TaskStatus.RUNNING.value
+        )
 
     # Trigger recovery sweep
-    await recover_interrupted_tasks()
+    recovered = await recover_interrupted_tasks()
+    assert recovered >= 1, "Recovery sweep should recover at least 1 stale task"
 
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT status, result_summary FROM agent_tasks WHERE id = $1", stale_task_id)
-    assert row["status"] == TaskStatus.FAILED.value, f"Expected status FAILED, got {row['status']}"
-    assert "interrupted" in row["result_summary"].lower(), f"Unexpected error message: {row['result_summary']}"
-    print("  [✓] Startup recovery sweep transitioned stale running task to FAILED.")
+        stale_row = await conn.fetchrow("SELECT status, result_summary FROM agent_tasks WHERE id = $1", stale_task_id)
+        active_row = await conn.fetchrow("SELECT status FROM agent_tasks WHERE id = $1", active_task_id)
+
+    assert stale_row["status"] == TaskStatus.FAILED.value, f"Expected stale task to be FAILED, got {stale_row['status']}"
+    assert "interrupted" in stale_row["result_summary"].lower(), f"Unexpected error message: {stale_row['result_summary']}"
+    assert active_row["status"] == TaskStatus.RUNNING.value, f"Expected active task with valid lease to remain RUNNING, got {active_row['status']}"
+    print("  [✓] Stale task recovered to FAILED; active task with valid lease was safely preserved as RUNNING.")
 
     # =========================================================================
     # TEST 9: Calculator Resource Safety, AST Depth, Node Count & Numerical Limits
@@ -340,6 +393,13 @@ async def run_day7_hardening_tests():
     except ValueError as e:
         assert "digits" in str(e).lower(), f"Unexpected error: {e}"
 
+    # Booleans rejected
+    try:
+        await calc.execute(test_session, expression="True + 1")
+        assert False, "Expected error on boolean literal"
+    except ValueError as e:
+        assert "boolean" in str(e).lower() or "syntax" in str(e).lower(), f"Unexpected error: {e}"
+
     # Complex power rejection
     try:
         await calc.execute(test_session, expression="(-4) ** 0.5")
@@ -354,7 +414,14 @@ async def run_day7_hardening_tests():
     except ValueError as e:
         assert "large" in str(e).lower() or "overflow" in str(e).lower(), f"Unexpected error: {e}"
 
-    print("  [✓] Calculator tool AST depth, node limit, digit limit, and complex power guards verified.")
+    # Magnitude > 1e15
+    try:
+        await calc.execute(test_session, expression="1000000000000001 + 1")
+        assert False, "Expected error on magnitude > 1e15"
+    except ValueError as e:
+        assert "magnitude" in str(e).lower(), f"Unexpected error: {e}"
+
+    print("  [✓] Calculator tool AST depth, node limit, digit limit, booleans, and magnitude guards verified.")
 
     # =========================================================================
     # TEST 10: Concurrent Note Creation Database-Level Idempotency
@@ -384,12 +451,166 @@ async def run_day7_hardening_tests():
     assert count == 1, f"Expected exactly 1 note in database, found {count}"
     print("  [✓] Database unique index and ON CONFLICT handling guaranteed concurrent note idempotency.")
 
+    # =========================================================================
+    # TEST 11: Approval State Machine Validations & Legacy Token Invalidation
+    # =========================================================================
+    print("\n--- [TEST 11] Approval State Machine Validations & Legacy Token Invalidation ---")
+    task_id_sm = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO agent_tasks (id, session_id, user_request, status, approval_status, approval_expires_at)
+            VALUES ($1, $2, 'State machine test', $3, $4, NOW() + INTERVAL '10 minutes')
+            """,
+            task_id_sm,
+            test_session,
+            TaskStatus.AWAITING_APPROVAL.value,
+            ApprovalStatus.PENDING.value
+        )
+    
+    # Valid rejection
+    reject_ok, reject_err = await reject_approval(task_id_sm, test_session)
+    assert reject_ok is True, f"Rejection failed: {reject_err}"
+    
+    # Verify task transitioned to CANCELLED and REJECTED
+    async with pool.acquire() as conn:
+        sm_row = await conn.fetchrow("SELECT status, approval_status FROM agent_tasks WHERE id = $1", task_id_sm)
+    assert sm_row["status"] == TaskStatus.CANCELLED.value
+    assert sm_row["approval_status"] == ApprovalStatus.REJECTED.value
+
+    # Rejecting an already rejected task must be denied
+    reject_again_ok, reject_again_err = await reject_approval(task_id_sm, test_session)
+    assert reject_again_ok is False
+    assert "cannot reject" in reject_again_err.lower()
+
+    # Rejecting task in non-awaiting status must be denied
+    task_id_completed = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO agent_tasks (id, session_id, user_request, status, approval_status)
+            VALUES ($1, $2, 'Completed job', $3, $4)
+            """,
+            task_id_completed,
+            test_session,
+            TaskStatus.SUCCEEDED.value,
+            ApprovalStatus.APPROVED.value
+        )
+    comp_rej_ok, comp_rej_err = await reject_approval(task_id_completed, test_session)
+    assert comp_rej_ok is False
+    assert "not awaiting approval" in comp_rej_err.lower()
+
+    # Rejecting expired task transitions it to expired/failed
+    task_id_expired = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO agent_tasks (id, session_id, user_request, status, approval_status, approval_expires_at)
+            VALUES ($1, $2, 'Expired job', $3, $4, NOW() - INTERVAL '5 minutes')
+            """,
+            task_id_expired,
+            test_session,
+            TaskStatus.AWAITING_APPROVAL.value,
+            ApprovalStatus.PENDING.value
+        )
+    exp_rej_ok, exp_rej_err = await reject_approval(task_id_expired, test_session)
+    assert exp_rej_ok is False
+    assert "expired" in exp_rej_err.lower()
+
+    # Legacy token fallback removal: token with plaintext only and NULL hash cannot be consumed
+    task_id_legacy = uuid.uuid4()
+    legacy_token = "legacy_secret_plaintext_token"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO agent_tasks (id, session_id, user_request, status, approval_status, approval_token, approval_token_hash, approval_expires_at)
+            VALUES ($1, $2, 'Legacy job', $3, $4, $5, NULL, NOW() + INTERVAL '10 minutes')
+            """,
+            task_id_legacy,
+            test_session,
+            TaskStatus.AWAITING_APPROVAL.value,
+            ApprovalStatus.PENDING.value,
+            legacy_token
+        )
+    leg_ok, leg_err = await validate_and_consume_approval(task_id_legacy, test_session, legacy_token)
+    assert leg_ok is False, "Legacy unhashed token must NOT be consumable"
+    assert "missing or legacy" in leg_err.lower() or "invalidated" in leg_err.lower()
+    print("  [✓] Approval state transitions validated; unhashed legacy tokens strictly rejected.")
+
+    # =========================================================================
+    # TEST 12: Audit Log Immutability Trigger
+    # =========================================================================
+    print("\n--- [TEST 12] Audit Log Immutability Trigger ---")
+    async with pool.acquire() as conn:
+        # Create a sample task and audit log
+        audit_task_id = uuid.uuid4()
+        await conn.execute(
+            """
+            INSERT INTO agent_tasks (id, session_id, user_request, status)
+            VALUES ($1, $2, 'Audit test task', 'succeeded')
+            """,
+            audit_task_id,
+            test_session
+        )
+        await conn.execute(
+            """
+            INSERT INTO agent_execution_logs (task_id, session_id, tool_name, status, result_summary)
+            VALUES ($1, $2, 'test_tool', 'succeeded', 'Audit event 1')
+            """,
+            audit_task_id,
+            test_session
+        )
+
+        log_row = await conn.fetchrow("SELECT id FROM agent_execution_logs WHERE task_id = $1 LIMIT 1", audit_task_id)
+        assert log_row is not None
+        log_id = log_row["id"]
+
+        # Attempt to modify audit log record
+        try:
+            await conn.execute("UPDATE agent_execution_logs SET result_summary = 'tampered' WHERE id = $1", log_id)
+            assert False, "UPDATE on agent_execution_logs must be rejected by PostgreSQL trigger"
+        except Exception as e:
+            assert "append-only" in str(e).lower() or "forbidden" in str(e).lower(), f"Unexpected error: {e}"
+        print("  [✓] Database trigger blocked unauthorized UPDATE on agent_execution_logs.")
+
+        # Attempt to delete audit log from a production/non-test session
+        prod_session_id = "prod-corp-client"
+        prod_task_id = uuid.uuid4()
+        await conn.execute(
+            """
+            INSERT INTO agent_tasks (id, session_id, user_request, status)
+            VALUES ($1, $2, 'Prod task', 'succeeded')
+            """,
+            prod_task_id,
+            prod_session_id
+        )
+        await conn.execute(
+            """
+            INSERT INTO agent_execution_logs (task_id, session_id, tool_name, status)
+            VALUES ($1, $2, 'tool', 'succeeded')
+            """,
+            prod_task_id,
+            prod_session_id
+        )
+        try:
+            await conn.execute("DELETE FROM agent_execution_logs WHERE session_id = $1", prod_session_id)
+            assert False, "DELETE on production audit log must be rejected by trigger"
+        except Exception as e:
+            assert "append-only" in str(e).lower() or "forbidden" in str(e).lower(), f"Unexpected error: {e}"
+        print("  [✓] Database trigger blocked unauthorized DELETE on production audit logs.")
+
+        # Clean up temporary test fixture within explicit transaction using SET LOCAL
+        async with conn.transaction():
+            await conn.execute("SET LOCAL memora.allow_audit_cleanup = 'on'")
+            await conn.execute("DELETE FROM agent_execution_logs WHERE session_id = $1", prod_session_id)
+            await conn.execute("DELETE FROM agent_tasks WHERE id = $1", prod_task_id)
+
     # Clean up test session notes
     await note_service.delete_all_notes(test_session)
     await close_db_pool()
 
     print("\n" + "=" * 80)
-    print("ALL 10 DAY 7 PRODUCTION HARDENING & INTEGRITY TESTS PASSED SUCCESSFULLY!")
+    print("ALL 12 DAY 7 & 7.1 PRODUCTION HARDENING, SECURITY & INTEGRITY TESTS PASSED!")
     print("=" * 80)
 
 if __name__ == "__main__":

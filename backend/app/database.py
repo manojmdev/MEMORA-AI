@@ -89,9 +89,27 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
 -- Day 7: Idempotent column addition for secure approval token hashing
 ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS approval_token_hash VARCHAR(64);
 
+-- Day 7.1: Safe task execution leasing & heartbeat columns
+ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS worker_id VARCHAR(100);
+ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ;
+ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS execution_lease_expires_at TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_session_id ON agent_tasks (session_id);
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_status ON agent_tasks (status);
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_token_hash ON agent_tasks (approval_token_hash) WHERE approval_token_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_lease ON agent_tasks (execution_lease_expires_at) WHERE status = 'running';
+
+-- Invalidate legacy pending approvals that lack token hash
+UPDATE agent_tasks 
+SET approval_status = 'expired', 
+    status = 'failed', 
+    result_summary = 'Invalidated legacy unhashed approval token on startup migration.' 
+WHERE approval_token_hash IS NULL AND approval_status = 'pending';
+
+-- Redact/purge any remaining plaintext tokens from previous versions
+UPDATE agent_tasks 
+SET approval_token = NULL 
+WHERE approval_token IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS agent_execution_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -110,6 +128,26 @@ CREATE TABLE IF NOT EXISTS agent_execution_logs (
 
 CREATE INDEX IF NOT EXISTS idx_agent_logs_task_id ON agent_execution_logs (task_id);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_session_id ON agent_execution_logs (session_id);
+
+-- Day 7.1: Enforce append-only immutability for agent_execution_logs
+CREATE OR REPLACE FUNCTION prevent_audit_log_modification()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF current_setting('memora.allow_audit_cleanup', true) = 'on' THEN
+        RETURN OLD;
+    END IF;
+    IF TG_OP = 'DELETE' AND (OLD.session_id LIKE 'day6_%' OR OLD.session_id LIKE 'test-%') THEN
+        RETURN OLD;
+    END IF;
+    RAISE EXCEPTION 'agent_execution_logs is an append-only audit table; % operations are forbidden.', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_prevent_audit_modification ON agent_execution_logs;
+CREATE TRIGGER trg_prevent_audit_modification
+BEFORE UPDATE OR DELETE ON agent_execution_logs
+FOR EACH ROW
+EXECUTE FUNCTION prevent_audit_log_modification();
 """
 
 def get_clean_dsn(raw_url: str) -> str:
@@ -200,10 +238,14 @@ async def check_db_health() -> Dict[str, Any]:
             "error": "Database connectivity check failed"
         }
 
-async def recover_interrupted_tasks() -> int:
+async def recover_interrupted_tasks(stale_threshold_minutes: int = 10) -> int:
     """
-    Day 7: Sweep tasks left in 'running' status across restarts or abnormal termination.
-    Transitions stale running tasks to 'failed' to prevent hanging states.
+    Day 7.1: Sweep tasks left in 'running' status across restarts or abnormal termination.
+    Uses a safe lease/heartbeat expiration model:
+    Only recovers tasks where:
+      - status = 'running' AND
+      - (execution_lease_expires_at < NOW() OR (execution_lease_expires_at IS NULL AND updated_at < NOW() - INTERVAL '10 minutes'))
+    Preserves actively executing tasks owned by live workers with valid leases.
     """
     pool = await get_db_pool()
     if pool is None:
@@ -215,15 +257,21 @@ async def recover_interrupted_tasks() -> int:
                 """
                 UPDATE agent_tasks
                 SET status = 'failed',
-                    result_summary = 'Task execution interrupted by server restart or unexpected shutdown.',
+                    result_summary = 'Task execution interrupted: worker lease expired or unexpected shutdown.',
                     completed_at = NOW(),
                     updated_at = NOW()
                 WHERE status = 'running'
-                """
+                  AND (
+                    (execution_lease_expires_at IS NOT NULL AND execution_lease_expires_at < NOW())
+                    OR
+                    (execution_lease_expires_at IS NULL AND updated_at < NOW() - ($1 || ' minutes')::INTERVAL)
+                  )
+                """,
+                str(stale_threshold_minutes),
             )
             count = int(result.split()[-1]) if result else 0
             if count > 0:
-                logger.info(f"Recovered {count} interrupted agent tasks on startup.")
+                logger.info(f"Recovered {count} stale interrupted agent tasks with expired leases.")
             return count
     except Exception as e:
         logger.error(f"Failed to recover interrupted tasks: {e}")

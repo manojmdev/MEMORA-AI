@@ -5,7 +5,7 @@ Coordinates intent analysis, memory retrieval, planning, validation, controlled 
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any, Tuple
 from uuid import UUID, uuid4
 from app.database import get_db_pool
@@ -484,6 +484,11 @@ class AgentOrchestrator:
             return
 
         plan_json_str = task.plan.model_dump_json() if task.plan else None
+        now_utc = datetime.now(timezone.utc)
+        is_running = (task.status == TaskStatus.RUNNING)
+        worker_id = "memora-orchestrator-worker" if is_running else None
+        last_heartbeat_at = now_utc if is_running else None
+        execution_lease_expires_at = (now_utc + timedelta(minutes=5)) if is_running else None
 
         async with pool.acquire() as conn:
             await conn.execute(
@@ -491,9 +496,15 @@ class AgentOrchestrator:
                 INSERT INTO agent_tasks (
                     id, session_id, user_request, task_type, plan_json, status,
                     result_summary, approval_token, approval_status, approval_expires_at,
+                    worker_id, last_heartbeat_at, execution_lease_expires_at,
                     created_at, updated_at, completed_at
                 )
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13)
+                VALUES (
+                    $1, $2, $3, $4, $5::jsonb, $6,
+                    $7, $8, $9, $10,
+                    $11, $12, $13,
+                    $14, $15, $16
+                )
                 """,
                 task.id,
                 task.session_id,
@@ -505,18 +516,26 @@ class AgentOrchestrator:
                 None,
                 task.approval_status,
                 task.approval_expires_at,
+                worker_id,
+                last_heartbeat_at,
+                execution_lease_expires_at,
                 task.created_at,
                 task.updated_at,
                 task.completed_at,
             )
 
     async def _update_task_record(self, task: AgentTask) -> None:
-        """Update existing task state in agent_tasks."""
+        """Update existing task state in agent_tasks with execution lease tracking."""
         pool = await get_db_pool()
         if pool is None:
             return
 
         plan_json_str = task.plan.model_dump_json() if task.plan else None
+        now_utc = datetime.now(timezone.utc)
+        is_running = (task.status == TaskStatus.RUNNING)
+        worker_id = "memora-orchestrator-worker" if is_running else None
+        last_heartbeat_at = now_utc if is_running else None
+        execution_lease_expires_at = (now_utc + timedelta(minutes=5)) if is_running else None
 
         async with pool.acquire() as conn:
             await conn.execute(
@@ -527,15 +546,21 @@ class AgentOrchestrator:
                     result_summary = $3,
                     approval_status = $4,
                     approval_expires_at = $5,
+                    worker_id = $6,
+                    last_heartbeat_at = $7,
+                    execution_lease_expires_at = $8,
                     updated_at = NOW(),
-                    completed_at = $6
-                WHERE id = $7 AND session_id = $8
+                    completed_at = $9
+                WHERE id = $10 AND session_id = $11
                 """,
                 plan_json_str,
                 task.status.value,
                 task.result_summary,
                 task.approval_status,
                 task.approval_expires_at,
+                worker_id,
+                last_heartbeat_at,
+                execution_lease_expires_at,
                 task.completed_at,
                 task.id,
                 task.session_id,
