@@ -54,6 +54,55 @@ CREATE INDEX IF NOT EXISTS idx_memories_status_valid ON memories (session_id, me
 CREATE INDEX IF NOT EXISTS idx_memories_embedding 
 ON memories USING hnsw (embedding vector_cosine_ops) 
 WHERE is_active = TRUE;
+
+-- Day 6: Agentic Task Execution & Notes Storage
+CREATE TABLE IF NOT EXISTS notes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id VARCHAR(255) NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_session_id ON notes (session_id);
+
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id VARCHAR(255) NOT NULL,
+    user_request TEXT NOT NULL,
+    task_type VARCHAR(100),
+    plan_json JSONB,
+    status VARCHAR(50) NOT NULL DEFAULT 'proposed',
+    result_summary TEXT,
+    approval_token VARCHAR(255),
+    approval_status VARCHAR(50),
+    approval_expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_session_id ON agent_tasks (session_id);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_status ON agent_tasks (status);
+
+CREATE TABLE IF NOT EXISTS agent_execution_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+    session_id VARCHAR(255) NOT NULL,
+    step_id VARCHAR(100),
+    tool_name VARCHAR(100) NOT NULL,
+    arguments_json JSONB,
+    status VARCHAR(50) NOT NULL,
+    approval_status VARCHAR(50),
+    result_summary TEXT,
+    error_code VARCHAR(100),
+    duration_ms INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_logs_task_id ON agent_execution_logs (task_id);
+CREATE INDEX IF NOT EXISTS idx_agent_logs_session_id ON agent_execution_logs (session_id);
 """
 
 def get_clean_dsn(raw_url: str) -> str:
