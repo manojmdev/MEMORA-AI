@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Path to backend/.env
@@ -24,6 +25,11 @@ class Settings(BaseSettings):
     # Day 7: Environment & Production Safety Gates
     ENVIRONMENT: str = "development"
     ENABLE_EVALUATION_ENDPOINT: bool = False
+
+    # Day 7.2: Genuine Authentication & Worker Lease Configuration
+    AUTH_SECRET_KEY: Optional[str] = None
+    API_AUTH_TOKENS: Optional[str] = None  # Format: "token:user_id:session_id,..."
+    WORKER_LEASE_MINUTES: int = 5
 
     model_config = SettingsConfigDict(
         env_file=(str(ENV_FILE), ".env", str(Path(__file__).resolve().parent.parent.parent / ".env.local")),

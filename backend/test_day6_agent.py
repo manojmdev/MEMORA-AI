@@ -453,8 +453,10 @@ async def run_day6_agent_tests():
         await note_service.delete_all_notes(session_alpha)
         await note_service.delete_all_notes(session_beta)
         async with pool.acquire() as conn:
-            await conn.execute("DELETE FROM agent_execution_logs WHERE session_id IN ($1, $2)", session_alpha, session_beta)
-            await conn.execute("DELETE FROM agent_tasks WHERE session_id IN ($1, $2)", session_alpha, session_beta)
+            async with conn.transaction():
+                await conn.execute("SET LOCAL memora.allow_audit_cleanup = 'on'")
+                await conn.execute("DELETE FROM agent_execution_logs WHERE session_id IN ($1, $2)", session_alpha, session_beta)
+                await conn.execute("DELETE FROM agent_tasks WHERE session_id IN ($1, $2)", session_alpha, session_beta)
         await close_db_pool()
         print("Test sessions cleaned up.")
 

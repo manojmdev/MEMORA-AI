@@ -129,14 +129,11 @@ CREATE TABLE IF NOT EXISTS agent_execution_logs (
 CREATE INDEX IF NOT EXISTS idx_agent_logs_task_id ON agent_execution_logs (task_id);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_session_id ON agent_execution_logs (session_id);
 
--- Day 7.1: Enforce append-only immutability for agent_execution_logs
+-- Day 7.2: Strict append-only immutability for agent_execution_logs (zero session backdoor)
 CREATE OR REPLACE FUNCTION prevent_audit_log_modification()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF current_setting('memora.allow_audit_cleanup', true) = 'on' THEN
-        RETURN OLD;
-    END IF;
-    IF TG_OP = 'DELETE' AND (OLD.session_id LIKE 'day6_%' OR OLD.session_id LIKE 'test-%') THEN
+    IF TG_OP = 'DELETE' AND current_setting('memora.allow_audit_cleanup', true) = 'on' THEN
         RETURN OLD;
     END IF;
     RAISE EXCEPTION 'agent_execution_logs is an append-only audit table; % operations are forbidden.', TG_OP;
@@ -258,6 +255,7 @@ async def recover_interrupted_tasks(stale_threshold_minutes: int = 10) -> int:
                 UPDATE agent_tasks
                 SET status = 'failed',
                     result_summary = 'Task execution interrupted: worker lease expired or unexpected shutdown.',
+                    execution_lease_expires_at = NULL,
                     completed_at = NOW(),
                     updated_at = NOW()
                 WHERE status = 'running'

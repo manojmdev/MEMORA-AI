@@ -33,7 +33,9 @@ from app.agent.approval_manager import (
 )
 from app.agent.execution_engine import execute_step
 from app.agent.response_composer import compose_agent_response
+from app.agent.worker_identity import WorkerIdentity
 from app.services.hybrid_retriever import retrieve_hybrid_memories
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -229,12 +231,18 @@ class AgentOrchestrator:
                 reply = compose_agent_response(task, recalled_memories)
                 return AgentTaskResponse(task=task, reply=reply, tools_executed=tools_executed, execution_timeline=timeline)
 
+            # Day 7.2: Renew task execution lease & heartbeat before tool execution
+            await self.renew_heartbeat(task.id, task.session_id)
+
             # Execute step
             result = await execute_step(
                 task_id=task.id,
                 session_id=task.session_id,
                 step=step
             )
+
+            # Day 7.2: Renew lease & heartbeat after step completion
+            await self.renew_heartbeat(task.id, task.session_id)
 
             if step.tool_name:
                 tools_executed.append(step.tool_name)
@@ -477,6 +485,47 @@ class AgentOrchestrator:
                 for r in rows
             ]
 
+    async def renew_heartbeat(
+        self,
+        task_id: UUID,
+        session_id: str,
+        lease_minutes: Optional[int] = None
+    ) -> bool:
+        """
+        Day 7.2: Renewable execution heartbeat.
+        Extends task lease and timestamps the active worker heartbeat in Neon PostgreSQL.
+        """
+        pool = await get_db_pool()
+        if pool is None:
+            return False
+
+        worker_id = WorkerIdentity.get_worker_id()
+        lease_duration = lease_minutes or getattr(settings, "WORKER_LEASE_MINUTES", 5)
+        now_utc = datetime.now(timezone.utc)
+        expires_at = now_utc + timedelta(minutes=lease_duration)
+
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE agent_tasks
+                SET last_heartbeat_at = $1,
+                    execution_lease_expires_at = $2,
+                    worker_id = $3,
+                    updated_at = NOW()
+                WHERE id = $4 AND session_id = $5 AND status = 'running'
+                """,
+                now_utc,
+                expires_at,
+                worker_id,
+                task_id,
+                session_id.strip()
+            )
+            count = int(result.split()[-1]) if result else 0
+            if count > 0:
+                logger.debug(f"Heartbeat renewed for task {task_id} by worker {worker_id} (lease valid until {expires_at}).")
+                return True
+            return False
+
     async def _persist_new_task(self, task: AgentTask) -> None:
         """Insert a newly created task into agent_tasks in Neon DB."""
         pool = await get_db_pool()
@@ -486,9 +535,10 @@ class AgentOrchestrator:
         plan_json_str = task.plan.model_dump_json() if task.plan else None
         now_utc = datetime.now(timezone.utc)
         is_running = (task.status == TaskStatus.RUNNING)
-        worker_id = "memora-orchestrator-worker" if is_running else None
+        worker_id = WorkerIdentity.get_worker_id() if is_running else None
         last_heartbeat_at = now_utc if is_running else None
-        execution_lease_expires_at = (now_utc + timedelta(minutes=5)) if is_running else None
+        lease_minutes = getattr(settings, "WORKER_LEASE_MINUTES", 5)
+        execution_lease_expires_at = (now_utc + timedelta(minutes=lease_minutes)) if is_running else None
 
         async with pool.acquire() as conn:
             await conn.execute(
@@ -533,9 +583,10 @@ class AgentOrchestrator:
         plan_json_str = task.plan.model_dump_json() if task.plan else None
         now_utc = datetime.now(timezone.utc)
         is_running = (task.status == TaskStatus.RUNNING)
-        worker_id = "memora-orchestrator-worker" if is_running else None
+        worker_id = WorkerIdentity.get_worker_id() if is_running else None
         last_heartbeat_at = now_utc if is_running else None
-        execution_lease_expires_at = (now_utc + timedelta(minutes=5)) if is_running else None
+        lease_minutes = getattr(settings, "WORKER_LEASE_MINUTES", 5)
+        execution_lease_expires_at = (now_utc + timedelta(minutes=lease_minutes)) if is_running else None
 
         async with pool.acquire() as conn:
             await conn.execute(

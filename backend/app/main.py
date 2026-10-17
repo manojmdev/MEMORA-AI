@@ -3,7 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional, List, Set
 from uuid import UUID, uuid4
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.schemas import (
@@ -37,7 +37,7 @@ from app.agent.models import (
 from app.agent.orchestrator import agent_orchestrator
 from app.services import note_service
 from app.database import init_db_pool, close_db_pool, check_db_health, recover_interrupted_tasks
-from app.auth.session_guard import validate_session_id
+from app.auth.session_guard import validate_session_id, get_current_principal, UserPrincipal
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -130,8 +130,12 @@ async def health():
 
 @app.post("/api/chat", response_model=ChatResponse)
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest, req: Request):
-    valid_sid = validate_session_id(request.session_id)
+async def chat(
+    request: ChatRequest,
+    req: Request,
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    valid_sid = validate_session_id(request.session_id, principal)
     try:
         reply, recalled, extracted = await generate_personalized_response(
             message=request.message,
@@ -156,13 +160,14 @@ async def search_memories(
     session_id: str = Query(default="default-session", description="Session identifier"),
     category: Optional[str] = Query(default=None, description="Optional category filter"),
     mode: str = Query(default="hybrid", description="Search mode: 'hybrid', 'semantic', or 'keyword'"),
-    limit: int = Query(default=5, ge=1, le=20)
+    limit: int = Query(default=5, ge=1, le=20),
+    principal: UserPrincipal = Depends(get_current_principal)
 ):
     """
     Search active memories for a session using hybrid (semantic + keyword),
     semantic-only (pgvector), or keyword-only retrieval.
     """
-    valid_sid = validate_session_id(session_id)
+    valid_sid = validate_session_id(session_id, principal)
     try:
         if mode == "semantic":
             return await default_semantic_retriever.retrieve(
@@ -213,9 +218,10 @@ async def search_memories(
 async def get_memories(
     req: Request,
     session_id: str = Query(default="default-session", description="Session identifier"),
-    category: Optional[str] = Query(default=None, description="Optional category filter")
+    category: Optional[str] = Query(default=None, description="Optional category filter"),
+    principal: UserPrincipal = Depends(get_current_principal)
 ):
-    valid_sid = validate_session_id(session_id)
+    valid_sid = validate_session_id(session_id, principal)
     try:
         memories = await list_memories(session_id=valid_sid, category=category, is_active=True)
         return MemoryListResponse(
@@ -232,9 +238,10 @@ async def get_memories(
 async def get_single_memory(
     memory_id: UUID,
     req: Request,
-    session_id: str = Query(default="default-session", description="Session identifier")
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
 ):
-    valid_sid = validate_session_id(session_id)
+    valid_sid = validate_session_id(session_id, principal)
     try:
         mem = await get_memory(session_id=valid_sid, memory_id=memory_id)
         if not mem:
@@ -249,9 +256,10 @@ async def get_single_memory(
 async def remove_memory(
     memory_id: UUID,
     req: Request,
-    session_id: str = Query(default="default-session", description="Session identifier")
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
 ):
-    valid_sid = validate_session_id(session_id)
+    valid_sid = validate_session_id(session_id, principal)
     try:
         deleted = await delete_memory(session_id=valid_sid, memory_id=memory_id)
         if not deleted:
@@ -269,9 +277,10 @@ async def remove_memory(
 @app.delete("/api/memories", response_model=DeleteResponse)
 async def clear_session_memories(
     req: Request,
-    session_id: str = Query(default="default-session", description="Session identifier")
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
 ):
-    valid_sid = validate_session_id(session_id)
+    valid_sid = validate_session_id(session_id, principal)
     try:
         count = await delete_all_memories(session_id=valid_sid)
         return DeleteResponse(
@@ -309,13 +318,17 @@ async def run_evaluation_benchmark(req: Request):
 # ============================================================================
 
 @app.post("/api/agent/run", response_model=AgentTaskResponse)
-async def run_agent_task(request: AgentRunRequest, req: Request):
+async def run_agent_task(
+    request: AgentRunRequest,
+    req: Request,
+    principal: UserPrincipal = Depends(get_current_principal)
+):
     """
     Run the Day 6 Agentic Orchestrator on a user task request.
     Analyzes intent, plans tasks with registered tools, executes automatic steps,
     and pauses at persistent actions awaiting explicit user approval.
     """
-    valid_sid = validate_session_id(request.session_id)
+    valid_sid = validate_session_id(request.session_id, principal)
     try:
         return await agent_orchestrator.run_agent_task(
             message=request.message,
@@ -330,10 +343,11 @@ async def run_agent_task(request: AgentRunRequest, req: Request):
 async def list_agent_tasks(
     req: Request,
     session_id: str = Query(default="default-session", description="Session identifier"),
-    limit: int = Query(default=20, ge=1, le=100)
+    limit: int = Query(default=20, ge=1, le=100),
+    principal: UserPrincipal = Depends(get_current_principal)
 ):
     """List agent tasks strictly scoped to the requesting session."""
-    valid_sid = validate_session_id(session_id)
+    valid_sid = validate_session_id(session_id, principal)
     try:
         return await agent_orchestrator.list_tasks(session_id=valid_sid, limit=limit)
     except HTTPException:
@@ -345,10 +359,11 @@ async def list_agent_tasks(
 async def get_agent_task_detail(
     task_id: UUID,
     req: Request,
-    session_id: str = Query(default="default-session", description="Session identifier")
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
 ):
     """Fetch task details and current plan status for an agent task."""
-    valid_sid = validate_session_id(session_id)
+    valid_sid = validate_session_id(session_id, principal)
     try:
         task = await agent_orchestrator.get_task(session_id=valid_sid, task_id=task_id)
         if not task:
@@ -363,13 +378,14 @@ async def get_agent_task_detail(
 async def approve_agent_task(
     task_id: UUID,
     request: ApprovalActionRequest,
-    req: Request
+    req: Request,
+    principal: UserPrincipal = Depends(get_current_principal)
 ):
     """
     Approve a pending approval step for an agent task using a cryptographically signed token.
     Resumes task execution from the pending step.
     """
-    valid_sid = validate_session_id(request.session_id)
+    valid_sid = validate_session_id(request.session_id, principal)
     try:
         return await agent_orchestrator.approve_and_resume(
             session_id=valid_sid,
@@ -389,13 +405,14 @@ async def approve_agent_task(
 async def reject_agent_task(
     task_id: UUID,
     request: ApprovalActionRequest,
-    req: Request
+    req: Request,
+    principal: UserPrincipal = Depends(get_current_principal)
 ):
     """
     Reject a pending approval step for an agent task.
     Safely transitions task to CANCELLED and prevents further execution.
     """
-    valid_sid = validate_session_id(request.session_id)
+    valid_sid = validate_session_id(request.session_id, principal)
     try:
         return await agent_orchestrator.reject_task(
             session_id=valid_sid,
@@ -414,10 +431,11 @@ async def reject_agent_task(
 async def get_agent_task_logs(
     task_id: UUID,
     req: Request,
-    session_id: str = Query(default="default-session", description="Session identifier")
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
 ):
     """Fetch immutable execution audit logs for an agent task."""
-    valid_sid = validate_session_id(session_id)
+    valid_sid = validate_session_id(session_id, principal)
     try:
         return await agent_orchestrator.get_task_logs(session_id=valid_sid, task_id=task_id)
     except HTTPException:
@@ -429,10 +447,11 @@ async def get_agent_task_logs(
 async def list_user_notes(
     req: Request,
     session_id: str = Query(default="default-session", description="Session identifier"),
-    limit: int = Query(default=50, ge=1, le=100)
+    limit: int = Query(default=50, ge=1, le=100),
+    principal: UserPrincipal = Depends(get_current_principal)
 ):
     """Retrieve persistent notes created by agent or user in this session."""
-    valid_sid = validate_session_id(session_id)
+    valid_sid = validate_session_id(session_id, principal)
     try:
         notes = await note_service.list_notes(session_id=valid_sid, limit=limit)
         return NoteListResponse(
@@ -449,10 +468,11 @@ async def list_user_notes(
 async def delete_user_note(
     note_id: UUID,
     req: Request,
-    session_id: str = Query(default="default-session", description="Session identifier")
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
 ):
     """Delete a persistent note belonging to this session."""
-    valid_sid = validate_session_id(session_id)
+    valid_sid = validate_session_id(session_id, principal)
     try:
         deleted = await note_service.delete_note(session_id=valid_sid, note_id=note_id)
         if not deleted:

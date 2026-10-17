@@ -599,11 +599,19 @@ async def run_day7_hardening_tests():
             assert "append-only" in str(e).lower() or "forbidden" in str(e).lower(), f"Unexpected error: {e}"
         print("  [✓] Database trigger blocked unauthorized DELETE on production audit logs.")
 
-        # Clean up temporary test fixture within explicit transaction using SET LOCAL
+        # Day 7.2 Strict check: Even a test-prefixed session cannot bypass trigger without session setting
+        try:
+            await conn.execute("DELETE FROM agent_execution_logs WHERE session_id = $1", test_session)
+            assert False, "DELETE on test session audit log must be rejected without allow_audit_cleanup"
+        except Exception as e:
+            assert "append-only" in str(e).lower() or "forbidden" in str(e).lower(), f"Unexpected error: {e}"
+        print("  [✓] Database trigger blocked unauthorized DELETE even on test-prefixed session.")
+
+        # Clean up temporary test fixtures within explicit transaction using SET LOCAL
         async with conn.transaction():
             await conn.execute("SET LOCAL memora.allow_audit_cleanup = 'on'")
-            await conn.execute("DELETE FROM agent_execution_logs WHERE session_id = $1", prod_session_id)
-            await conn.execute("DELETE FROM agent_tasks WHERE id = $1", prod_task_id)
+            await conn.execute("DELETE FROM agent_execution_logs WHERE session_id IN ($1, $2)", prod_session_id, test_session)
+            await conn.execute("DELETE FROM agent_tasks WHERE id IN ($1, $2)", prod_task_id, audit_task_id)
 
     # Clean up test session notes
     await note_service.delete_all_notes(test_session)
