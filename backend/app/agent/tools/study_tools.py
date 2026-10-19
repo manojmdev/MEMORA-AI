@@ -39,6 +39,25 @@ Keep each day's topic and activities concise and brief (1-2 bullet points per da
 Respond ONLY with valid JSON. No conversational fluff or markdown fences.
 """
 
+from pydantic import BaseModel, Field, model_validator
+
+class GenerateStudyPlanArgs(BaseModel):
+    subject: Optional[str] = Field(default=None, description="Subject or skill to learn")
+    topic: Optional[str] = Field(default=None, description="Alias for subject")
+    duration_days: Optional[int] = Field(default=7, ge=1, le=90, description="Plan duration in days")
+    hours_per_day: Optional[float] = Field(default=2.0, ge=0.5, le=16.0, description="Daily study hours")
+    focus_areas: Optional[List[str]] = Field(default_factory=list, description="Specific focus areas")
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_subject(cls, data: Any):
+        if isinstance(data, dict):
+            subj = data.get("subject") or data.get("topic")
+            if not subj or not str(subj).strip():
+                raise ValueError("Field 'subject' (or 'topic') is required and must not be empty.")
+            data["subject"] = str(subj).strip()
+        return data
+
 class GenerateStudyPlanTool(BaseTool):
     name = "generate_study_plan"
     description = (
@@ -48,6 +67,10 @@ class GenerateStudyPlanTool(BaseTool):
     )
     permission = ToolPermission.AUTOMATIC
     timeout_seconds = 60.0
+    is_idempotent = True
+    category = "curriculum"
+    risk_level = "safe_readonly"
+    args_schema = GenerateStudyPlanArgs
 
     async def execute(self, session_id: str, **kwargs) -> Dict[str, Any]:
         subject = (

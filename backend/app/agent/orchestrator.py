@@ -13,13 +13,16 @@ from app.agent.models import (
     AgentTask,
     AgentPlan,
     AgentPlanStep,
+    AgentTaskCheckpoint,
     TaskStatus,
     StepStatus,
     ToolPermission,
     ApprovalStatus,
+    ErrorClassification,
     AgentTaskResponse,
     AgentExecutionEvent,
-    ApprovalRequest
+    ApprovalRequest,
+    StaleWorkerError
 )
 from app.agent.intent_analyzer import analyze_intent
 from app.agent.planner import generate_plan
@@ -32,8 +35,10 @@ from app.agent.approval_manager import (
     reject_approval
 )
 from app.agent.execution_engine import execute_step
+from app.agent.checkpoint_manager import checkpoint_manager
 from app.agent.response_composer import compose_agent_response
 from app.agent.worker_identity import WorkerIdentity
+from app.agent.tools.registry import tool_registry
 from app.services.hybrid_retriever import retrieve_hybrid_memories
 from app.config import settings
 
@@ -44,6 +49,9 @@ MAX_TOOL_EXECUTIONS_PER_TASK = 5
 
 class AgentOrchestrator:
     """Unified single-orchestrator controlling memory-aware task execution."""
+
+    def __init__(self):
+        self._active_tasks: Dict[UUID, asyncio.Task] = {}
 
     async def run_agent_task(
         self,
@@ -63,10 +71,9 @@ class AgentOrchestrator:
     ) -> AgentTaskResponse:
         """
         Execute an agent task:
-        1. Retrieve relevant memories.
-        2. Analyze intent.
-        3. Plan and validate execution steps.
-        4. Execute automatic steps or pause for user approval on persistent writes.
+        1. Retrieve relevant memories and analyze intent concurrently.
+        2. Plan and validate execution steps.
+        3. Execute automatic steps or pause for user approval on persistent writes.
         """
         req = user_request or message or ""
         clean_session = session_id.strip() if session_id else "default-session"
@@ -75,15 +82,17 @@ class AgentOrchestrator:
         task_id = uuid4()
         now = datetime.now(timezone.utc)
 
-        # 1. Retrieve relevant user memories for context
-        recalled_memories = await retrieve_hybrid_memories(
+        # 1 & 2. Concurrently retrieve relevant user memories and analyze intent
+        recalled_memories_task = retrieve_hybrid_memories(
             session_id=clean_session,
             query=clean_request,
             limit=4
         )
-
-        # 2. Analyze intent
-        intent_data = await analyze_intent(clean_request)
+        intent_task = analyze_intent(clean_request)
+        recalled_memories, intent_data = await asyncio.gather(
+            recalled_memories_task,
+            intent_task
+        )
         task_type = intent_data.get("intent", "general")
 
         if task_type == "disallowed":
@@ -114,6 +123,32 @@ class AgentOrchestrator:
             retrieved_memories=recalled_memories,
             max_steps=6
         )
+
+        # 3b. Check for clarification requirement
+        if proposed_plan.requires_clarification:
+            task = AgentTask(
+                id=task_id,
+                session_id=clean_session,
+                user_request=clean_request,
+                task_type=task_type,
+                plan=proposed_plan,
+                status=TaskStatus.AWAITING_CLARIFICATION,
+                requires_clarification=True,
+                clarification_prompt=proposed_plan.clarification_prompt,
+                result_summary=proposed_plan.clarification_prompt,
+                created_at=now,
+                updated_at=now,
+                completed_at=None
+            )
+            await self._persist_new_task(task)
+            reply = proposed_plan.clarification_prompt or "Your objective appears ambiguous or underspecified. Please specify what you would like to achieve."
+            return AgentTaskResponse(
+                task=task,
+                reply=reply,
+                memories_used=[m.model_dump(mode="json") for m in recalled_memories],
+                tools_executed=[],
+                execution_timeline=[]
+            )
 
         # 4. Validate plan authoritatively
         is_valid, plan, validation_error = validate_plan(proposed_plan)
@@ -161,126 +196,485 @@ class AgentOrchestrator:
         task: AgentTask,
         recalled_memories: Optional[List[Any]] = None
     ) -> AgentTaskResponse:
-        """Run through remaining plan steps, stopping if approval is required or a step fails."""
+        """Run through plan steps with durable checkpointing, worker leasing, retries, and failure reconciliation."""
         plan = task.plan
         if not plan:
             task.status = TaskStatus.FAILED
             await self._update_task_record(task)
             return AgentTaskResponse(task=task, reply="No valid plan found for task.")
 
-        tool_exec_count = 0
-        timeline = []
-        tools_executed = []
+        worker_id = WorkerIdentity.get_worker_id()
+        lease_seconds = getattr(settings, "WORKER_LEASE_SECONDS", 60)
+        claimed, lease_generation, claim_err = await self.claim_task_lease(
+            task.id, task.session_id, worker_id=worker_id, lease_seconds=lease_seconds
+        )
+        if not claimed:
+            logger.error(f"Cannot execute task {task.id}: {claim_err}")
+            raise StaleWorkerError(f"Cannot execute task: {claim_err}")
 
-        for step in plan.steps:
-            if step.status == StepStatus.SUCCEEDED:
-                tools_executed.append(step.tool_name or "reasoning")
-                continue
+        task.worker_id = worker_id
+        task.lease_generation = lease_generation
 
-            # Check dependencies: if any dependency failed, skip step
-            dep_failed = False
-            for dep_id in step.dependencies:
-                dep_step = next((s for s in plan.steps if s.step_id == dep_id), None)
-                if dep_step and dep_step.status != StepStatus.SUCCEEDED:
-                    dep_failed = True
-                    break
+        # Track active task for in-flight cancellation
+        current_async_task = asyncio.current_task()
+        if current_async_task:
+            self._active_tasks[task.id] = current_async_task
 
-            if dep_failed:
-                step.status = StepStatus.SKIPPED
-                step.error = "Skipped due to dependency failure."
-                timeline.append({"step_id": step.step_id, "status": "skipped"})
-                continue
+        try:
+            tool_exec_count = 0
+            timeline = []
+            tools_executed = []
 
-            # Check backend permissions (human-in-the-loop gate)
-            if step.permission == ToolPermission.APPROVAL_REQUIRED:
-                # Pause for approval
-                approval_req = create_approval_request(
+            # Load existing checkpoints to prevent duplicate execution of already-succeeded steps
+            existing_checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+            succeeded_step_ids = {
+                cp.step_id for cp in existing_checkpoints
+                if cp.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED)
+            }
+
+            for step in plan.steps:
+                matching_cp = next((c for c in existing_checkpoints if c.step_id == step.step_id), None)
+
+                # 1. Skip already succeeded step (Idempotency and duplicate prevention)
+                if step.step_id in succeeded_step_ids or step.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED):
+                    step.status = StepStatus.SUCCEEDED
+                    if matching_cp and matching_cp.result is not None:
+                        step.result = matching_cp.result
+                    tools_executed.append(step.tool_name or "reasoning")
+                    timeline.append({
+                        "step_id": step.step_id,
+                        "tool": step.tool_name,
+                        "status": "succeeded",
+                        "duration_ms": 0,
+                        "cached_checkpoint": True
+                    })
+                    continue
+
+                # 1b. Check if prior run crashed while in DISPATCHED or RUNNING (downstream reconciliation)
+                if matching_cp and matching_cp.status in (StepStatus.DISPATCHED, StepStatus.RUNNING):
+                    tool = tool_registry.get_tool(step.tool_name) if step.tool_name else None
+                    if tool and not tool.is_idempotent:
+                        logger.info(f"Step {step.step_id} ({tool.name}) was in {matching_cp.status.value} prior to crash. Initiating downstream reconciliation.")
+                        reconciled_res = await tool.reconcile(
+                            session_id=task.session_id,
+                            idempotency_key=matching_cp.idempotency_key,
+                            **step.arguments
+                        )
+                        if reconciled_res:
+                            logger.info(f"Reconciliation succeeded for step {step.step_id}: external operation confirmed.")
+                            step.status = StepStatus.SUCCEEDED
+                            step.result = reconciled_res
+                            await checkpoint_manager.update_checkpoint(
+                                task_id=task.id,
+                                session_id=task.session_id,
+                                step_id=step.step_id,
+                                status=StepStatus.SUCCEEDED,
+                                result=reconciled_res,
+                                external_operation_id=reconciled_res.get("note_id") or reconciled_res.get("external_operation_id"),
+                                worker_id=worker_id,
+                                lease_generation=lease_generation,
+                                completed=True
+                            )
+                            tools_executed.append(step.tool_name)
+                            timeline.append({
+                                "step_id": step.step_id,
+                                "tool": step.tool_name,
+                                "status": "succeeded",
+                                "duration_ms": 0,
+                                "reconciled": True
+                            })
+                            continue
+                        else:
+                            # Uncertain outcome: do NOT blindly replay!
+                            logger.warning(f"Reconciliation uncertain for step {step.step_id}. Halting and transitioning to NEEDS_RECONCILIATION.")
+                            step.status = StepStatus.NEEDS_RECONCILIATION
+                            task.status = TaskStatus.NEEDS_RECONCILIATION
+                            task.result_summary = f"Step {step.step_id} ({tool.name}) was interrupted during execution and downstream status could not be confirmed. Manual reconciliation required."
+                            await checkpoint_manager.update_checkpoint(
+                                task_id=task.id,
+                                session_id=task.session_id,
+                                step_id=step.step_id,
+                                status=StepStatus.NEEDS_RECONCILIATION,
+                                error_message=task.result_summary,
+                                error_classification=ErrorClassification.UNKNOWN_OUTCOME,
+                                worker_id=worker_id,
+                                lease_generation=lease_generation,
+                                completed=True
+                            )
+                            await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
+                            checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+                            task.checkpoints = checkpoints
+                            reply = compose_agent_response(task, recalled_memories)
+                            return AgentTaskResponse(
+                                task=task,
+                                reply=reply,
+                                tools_executed=tools_executed,
+                                execution_timeline=timeline,
+                                checkpoints=checkpoints
+                            )
+
+                # 2. Check dependencies: if any preceding dependency failed/skipped, skip this step
+                dep_failed = False
+                for dep_id in step.dependencies:
+                    dep_step = next((s for s in plan.steps if s.step_id == dep_id), None)
+                    if dep_step and dep_step.status not in (StepStatus.SUCCEEDED, StepStatus.COMPLETED):
+                        dep_failed = True
+                        break
+
+                if dep_failed:
+                    step.status = StepStatus.SKIPPED
+                    step.error = "Skipped due to dependency failure."
+                    await checkpoint_manager.update_checkpoint(
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        step_id=step.step_id,
+                        status=StepStatus.SKIPPED,
+                        error_message=step.error,
+                        worker_id=worker_id,
+                        lease_generation=lease_generation,
+                        completed=True
+                    )
+                    timeline.append({"step_id": step.step_id, "status": "skipped"})
+                    continue
+
+                # 3. Check backend permissions (human-in-the-loop gate)
+                if step.permission == ToolPermission.APPROVAL_REQUIRED:
+                    approval_req = create_approval_request(
+                        task_id=task.id,
+                        step_id=step.step_id,
+                        tool_name=step.tool_name or "create_note",
+                        arguments=step.arguments
+                    )
+                    step.status = StepStatus.AWAITING_APPROVAL
+                    task.status = TaskStatus.AWAITING_APPROVAL
+                    task.pending_approval = approval_req
+                    task.approval_token = approval_req.approval_token
+                    task.approval_status = ApprovalStatus.PENDING.value
+                    task.approval_expires_at = approval_req.expires_at
+
+                    await bind_approval_to_task(task.id, task.session_id, approval_req)
+                    await checkpoint_manager.update_checkpoint(
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        step_id=step.step_id,
+                        status=StepStatus.AWAITING_APPROVAL,
+                        worker_id=worker_id,
+                        lease_generation=lease_generation
+                    )
+                    await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
+
+                    checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+                    task.checkpoints = checkpoints
+                    reply = compose_agent_response(task, recalled_memories)
+                    return AgentTaskResponse(
+                        task=task,
+                        reply=reply,
+                        memories_used=[m.model_dump(mode="json") if hasattr(m, "model_dump") else m for m in (recalled_memories or [])],
+                        tools_executed=tools_executed,
+                        execution_timeline=timeline,
+                        checkpoints=checkpoints
+                    )
+
+                # 4. Enforce tool execution count limit per task
+                tool_exec_count += 1
+                if tool_exec_count > MAX_TOOL_EXECUTIONS_PER_TASK:
+                    step.status = StepStatus.FAILED
+                    step.error = f"Exceeded maximum limit of {MAX_TOOL_EXECUTIONS_PER_TASK} tool executions per task."
+                    step.error_classification = ErrorClassification.PERMANENT
+                    task.status = TaskStatus.FAILED
+                    task.result_summary = step.error
+                    task.completed_at = datetime.now(timezone.utc)
+                    await checkpoint_manager.update_checkpoint(
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        step_id=step.step_id,
+                        status=StepStatus.FAILED,
+                        error_message=step.error,
+                        error_classification=ErrorClassification.PERMANENT,
+                        worker_id=worker_id,
+                        lease_generation=lease_generation,
+                        completed=True
+                    )
+                    await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
+                    checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+                    task.checkpoints = checkpoints
+                    reply = compose_agent_response(task, recalled_memories)
+                    return AgentTaskResponse(
+                        task=task,
+                        reply=reply,
+                        tools_executed=tools_executed,
+                        execution_timeline=timeline,
+                        checkpoints=checkpoints
+                    )
+
+                # 5. Persist execution intent before dispatch
+                step_idempotency_key = step.idempotency_key or f"{task.id}:{step.step_id}"
+                step.idempotency_key = step_idempotency_key
+                await checkpoint_manager.update_checkpoint(
                     task_id=task.id,
+                    session_id=task.session_id,
                     step_id=step.step_id,
-                    tool_name=step.tool_name or "create_note",
-                    arguments=step.arguments
-                )
-                step.status = StepStatus.AWAITING_APPROVAL
-                task.status = TaskStatus.AWAITING_APPROVAL
-                task.pending_approval = approval_req
-                task.approval_token = approval_req.approval_token
-                task.approval_status = ApprovalStatus.PENDING.value
-                task.approval_expires_at = approval_req.expires_at
-
-                await bind_approval_to_task(task.id, task.session_id, approval_req)
-                await self._update_task_record(task)
-
-                reply = compose_agent_response(task, recalled_memories)
-                return AgentTaskResponse(
-                    task=task,
-                    reply=reply,
-                    memories_used=[m.model_dump(mode="json") if hasattr(m, "model_dump") else m for m in (recalled_memories or [])],
-                    tools_executed=tools_executed,
-                    execution_timeline=timeline
+                    status=StepStatus.DISPATCHED,
+                    idempotency_key=step_idempotency_key,
+                    worker_id=worker_id,
+                    lease_generation=lease_generation,
+                    started=True,
+                    execution_intent_persisted=True
                 )
 
-            # Enforce tool execution count limit per task
-            tool_exec_count += 1
-            if tool_exec_count > MAX_TOOL_EXECUTIONS_PER_TASK:
-                step.status = StepStatus.FAILED
-                step.error = f"Exceeded maximum limit of {MAX_TOOL_EXECUTIONS_PER_TASK} tool executions per task."
-                task.status = TaskStatus.FAILED
-                task.result_summary = step.error
-                task.completed_at = datetime.now(timezone.utc)
-                await self._update_task_record(task)
-                reply = compose_agent_response(task, recalled_memories)
-                return AgentTaskResponse(task=task, reply=reply, tools_executed=tools_executed, execution_timeline=timeline)
+                # 6. Checkpointed Execution & Retry loop with background heartbeat renewal
+                max_attempts = 1 + (step.max_retries if step.is_idempotent else 0)
+                attempt = 0
+                step_success = False
+                last_result = None
 
-            # Day 7.2: Renew task execution lease & heartbeat before tool execution
-            await self.renew_heartbeat(task.id, task.session_id)
+                while attempt < max_attempts:
+                    attempt += 1
 
-            # Execute step
-            result = await execute_step(
-                task_id=task.id,
-                session_id=task.session_id,
-                step=step
+                    if task.status == TaskStatus.CANCEL_REQUESTED:
+                        step.status = StepStatus.CANCELLED
+                        await checkpoint_manager.update_checkpoint(
+                            task_id=task.id,
+                            session_id=task.session_id,
+                            step_id=step.step_id,
+                            status=StepStatus.CANCELLED,
+                            worker_id=worker_id,
+                            lease_generation=lease_generation,
+                            completed=True
+                        )
+                        break
+
+                    heartbeat_stop = asyncio.Event()
+
+                    async def _bg_heartbeat():
+                        while not heartbeat_stop.is_set():
+                            try:
+                                await asyncio.sleep(min(15, max(1, lease_seconds // 3)))
+                                if heartbeat_stop.is_set():
+                                    break
+                                ok = await self.renew_heartbeat(
+                                    task_id=task.id,
+                                    session_id=task.session_id,
+                                    worker_id=worker_id,
+                                    lease_generation=lease_generation,
+                                    lease_seconds=lease_seconds
+                                )
+                                if not ok:
+                                    logger.warning(f"Periodic heartbeat renewal failed for task {task.id}.")
+                                    break
+                            except asyncio.CancelledError:
+                                break
+                            except Exception as e:
+                                logger.error(f"Heartbeat loop exception: {e}")
+
+                    hb_task = asyncio.create_task(_bg_heartbeat())
+
+                    try:
+                        result = await execute_step(
+                            task_id=task.id,
+                            session_id=task.session_id,
+                            step=step,
+                            idempotency_key=step_idempotency_key
+                        )
+                    except asyncio.CancelledError:
+                        logger.warning(f"Step {step.step_id} received in-flight cancellation signal.")
+                        tool = tool_registry.get_tool(step.tool_name) if step.tool_name else None
+                        if tool and not tool.is_idempotent:
+                            reconciled = await tool.reconcile(session_id=task.session_id, idempotency_key=step_idempotency_key, **step.arguments)
+                            if reconciled:
+                                step.status = StepStatus.SUCCEEDED
+                                step.result = reconciled
+                                task.status = TaskStatus.SUCCEEDED
+                                task.result_summary = "Operation completed before cancellation could take effect."
+                                await checkpoint_manager.update_checkpoint(
+                                    task_id=task.id,
+                                    session_id=task.session_id,
+                                    step_id=step.step_id,
+                                    status=StepStatus.SUCCEEDED,
+                                    result=reconciled,
+                                    worker_id=worker_id,
+                                    lease_generation=lease_generation,
+                                    completed=True
+                                )
+                            else:
+                                step.status = StepStatus.NEEDS_RECONCILIATION
+                                task.status = TaskStatus.NEEDS_RECONCILIATION
+                                task.result_summary = "In-flight cancellation during non-idempotent operation requires reconciliation."
+                                await checkpoint_manager.update_checkpoint(
+                                    task_id=task.id,
+                                    session_id=task.session_id,
+                                    step_id=step.step_id,
+                                    status=StepStatus.NEEDS_RECONCILIATION,
+                                    error_message="In-flight cancellation during non-idempotent operation requires reconciliation.",
+                                    error_classification=ErrorClassification.UNKNOWN_OUTCOME,
+                                    worker_id=worker_id,
+                                    lease_generation=lease_generation,
+                                    completed=True
+                                )
+                        else:
+                            step.status = StepStatus.CANCELLED
+                            task.status = TaskStatus.CANCELLED
+                            task.result_summary = "Task was cancelled by user."
+                            await checkpoint_manager.update_checkpoint(
+                                task_id=task.id,
+                                session_id=task.session_id,
+                                step_id=step.step_id,
+                                status=StepStatus.CANCELLED,
+                                worker_id=worker_id,
+                                lease_generation=lease_generation,
+                                completed=True
+                            )
+                        task.completed_at = datetime.now(timezone.utc)
+                        await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
+                        raise
+                    finally:
+                        heartbeat_stop.set()
+                        hb_task.cancel()
+
+                    last_result = result
+                    await self.renew_heartbeat(
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        worker_id=worker_id,
+                        lease_generation=lease_generation,
+                        lease_seconds=lease_seconds
+                    )
+
+                    if result.success:
+                        step_success = True
+                        await checkpoint_manager.update_checkpoint(
+                            task_id=task.id,
+                            session_id=task.session_id,
+                            step_id=step.step_id,
+                            status=StepStatus.SUCCEEDED,
+                            result=result.result,
+                            external_operation_id=result.external_operation_id,
+                            worker_id=worker_id,
+                            lease_generation=lease_generation,
+                            completed=True
+                        )
+                        break
+                    else:
+                        err_cls = result.error_classification or ErrorClassification.PERMANENT
+
+                        # Check for unknown outcome on non-idempotent operation
+                        if err_cls == ErrorClassification.UNKNOWN_OUTCOME or (not step.is_idempotent and err_cls not in (ErrorClassification.VALIDATION_FAILURE, ErrorClassification.AUTHORIZATION_FAILURE)):
+                            logger.warning(f"Step {step.step_id} non-idempotent operation encountered unknown outcome. Transitioning to NEEDS_RECONCILIATION.")
+                            step.status = StepStatus.NEEDS_RECONCILIATION
+                            task.status = TaskStatus.NEEDS_RECONCILIATION
+                            task.result_summary = f"Step {step.step_id} requires manual reconciliation: {result.error}"
+                            await checkpoint_manager.update_checkpoint(
+                                task_id=task.id,
+                                session_id=task.session_id,
+                                step_id=step.step_id,
+                                status=StepStatus.NEEDS_RECONCILIATION,
+                                error_message=result.error,
+                                error_classification=err_cls,
+                                worker_id=worker_id,
+                                lease_generation=lease_generation,
+                                completed=True
+                            )
+                            await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
+                            checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+                            task.checkpoints = checkpoints
+                            reply = compose_agent_response(task, recalled_memories)
+                            return AgentTaskResponse(
+                                task=task,
+                                reply=reply,
+                                tools_executed=tools_executed,
+                                execution_timeline=timeline,
+                                checkpoints=checkpoints
+                            )
+
+                        # Safe retry for transient errors on idempotent tools
+                        if err_cls in (ErrorClassification.TRANSIENT, ErrorClassification.TIMEOUT) and step.is_idempotent and attempt < max_attempts:
+                            logger.info(f"Transient error at step {step.step_id}. Retrying attempt {attempt}/{step.max_retries}...")
+                            step.status = StepStatus.RETRYING
+                            step.retry_count = attempt
+                            await checkpoint_manager.update_checkpoint(
+                                task_id=task.id,
+                                session_id=task.session_id,
+                                step_id=step.step_id,
+                                status=StepStatus.RETRYING,
+                                error_message=result.error,
+                                error_classification=err_cls,
+                                worker_id=worker_id,
+                                lease_generation=lease_generation,
+                                increment_retry=True
+                            )
+                            backoff = min(0.25 * (2 ** (attempt - 1)), 2.0)
+                            await asyncio.sleep(backoff)
+                            continue
+                        else:
+                            break
+
+                if step.tool_name:
+                    tools_executed.append(step.tool_name)
+
+                timeline.append({
+                    "step_id": step.step_id,
+                    "tool": step.tool_name,
+                    "status": step.status.value,
+                    "duration_ms": last_result.duration_ms if last_result else None
+                })
+
+                if not step_success:
+                    err_cls = last_result.error_classification if last_result else ErrorClassification.PERMANENT
+                    step.status = StepStatus.FAILED
+                    task.status = TaskStatus.FAILED
+                    task.result_summary = f"Execution failed at {step.step_id} ({step.tool_name}): {last_result.error if last_result else 'Unknown error'}"
+                    task.completed_at = datetime.now(timezone.utc)
+                    await checkpoint_manager.update_checkpoint(
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        step_id=step.step_id,
+                        status=StepStatus.FAILED,
+                        error_message=last_result.error if last_result else "Execution failed",
+                        error_classification=err_cls,
+                        worker_id=worker_id,
+                        lease_generation=lease_generation,
+                        completed=True
+                    )
+                    await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
+                    checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+                    task.checkpoints = checkpoints
+                    reply = compose_agent_response(task, recalled_memories)
+                    return AgentTaskResponse(
+                        task=task,
+                        reply=reply,
+                        memories_used=[m.model_dump(mode="json") if hasattr(m, "model_dump") else m for m in (recalled_memories or [])],
+                        tools_executed=tools_executed,
+                        execution_timeline=timeline,
+                        checkpoints=checkpoints
+                    )
+
+            # All steps succeeded
+            task.status = TaskStatus.SUCCEEDED
+            task.completed_at = datetime.now(timezone.utc)
+            task.result_summary = f"All {len(plan.steps)} plan steps executed successfully."
+            await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
+
+            checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+            task.checkpoints = checkpoints
+            reply = compose_agent_response(task, recalled_memories)
+            return AgentTaskResponse(
+                task=task,
+                reply=reply,
+                memories_used=[m.model_dump(mode="json") if hasattr(m, "model_dump") else m for m in (recalled_memories or [])],
+                tools_executed=tools_executed,
+                execution_timeline=timeline,
+                checkpoints=checkpoints
             )
-
-            # Day 7.2: Renew lease & heartbeat after step completion
-            await self.renew_heartbeat(task.id, task.session_id)
-
-            if step.tool_name:
-                tools_executed.append(step.tool_name)
-
-            timeline.append({
-                "step_id": step.step_id,
-                "tool": step.tool_name,
-                "status": step.status.value,
-                "duration_ms": result.duration_ms
-            })
-
-            if not result.success:
-                task.status = TaskStatus.FAILED
-                task.result_summary = f"Execution failed at {step.step_id} ({step.tool_name}): {result.error}"
-                task.completed_at = datetime.now(timezone.utc)
-                await self._update_task_record(task)
-                reply = compose_agent_response(task, recalled_memories)
-                return AgentTaskResponse(
-                    task=task,
-                    reply=reply,
-                    memories_used=[m.model_dump(mode="json") if hasattr(m, "model_dump") else m for m in (recalled_memories or [])],
-                    tools_executed=tools_executed,
-                    execution_timeline=timeline
-                )
-
-        # All steps succeeded
-        task.status = TaskStatus.SUCCEEDED
-        task.completed_at = datetime.now(timezone.utc)
-        task.result_summary = f"All {len(plan.steps)} plan steps executed successfully."
-        await self._update_task_record(task)
-
+        finally:
+            self._active_tasks.pop(task.id, None)
         reply = compose_agent_response(task, recalled_memories)
         return AgentTaskResponse(
             task=task,
             reply=reply,
             memories_used=[m.model_dump(mode="json") if hasattr(m, "model_dump") else m for m in (recalled_memories or [])],
             tools_executed=tools_executed,
-            execution_timeline=timeline
+            execution_timeline=timeline,
+            checkpoints=checkpoints
         )
 
     async def approve_task(
@@ -295,19 +689,24 @@ class AgentOrchestrator:
         # 1. Server-side validation of approval token & session ownership
         is_valid, err = await validate_and_consume_approval(task_id, clean_session, approval_token)
         if not is_valid:
-            if "access denied" in (err or "").lower() or "mismatch" in (err or "").lower():
-                raise PermissionError(f"Approval validation failed: {err}")
-            raise ValueError(f"Approval validation failed: {err}")
+            # Check if this is a safe recovery from an already-approved crash scenario
+            task = await self.get_task(clean_session, task_id)
+            if task and task.approval_status == ApprovalStatus.APPROVED and task.status in (TaskStatus.RUNNING, TaskStatus.AWAITING_APPROVAL):
+                logger.info(f"Task {task_id} was already approved; resuming execution from checkpoint.")
+            else:
+                if "access denied" in (err or "").lower() or "mismatch" in (err or "").lower():
+                    raise PermissionError(f"Approval validation failed: {err}")
+                raise ValueError(f"Approval validation failed: {err}")
+        else:
+            task = await self.get_task(clean_session, task_id)
 
-        task = await self.get_task(clean_session, task_id)
         if not task or not task.plan:
             return AgentTaskResponse(task=task, reply="Task or plan could not be restored.")
 
         task.status = TaskStatus.RUNNING
         task.pending_approval = None
 
-        # Resume execution
-        # Find the awaiting_approval step and mark it ready to execute
+        # Resume execution: find awaiting_approval step and mark it ready
         for step in task.plan.steps:
             if step.status == StepStatus.AWAITING_APPROVAL:
                 step.status = StepStatus.PENDING
@@ -324,19 +723,103 @@ class AgentOrchestrator:
         task_id: UUID,
         approval_token: Optional[str] = None
     ) -> AgentTaskResponse:
-        """User declined operation; transition task to CANCELLED."""
+        """User declined operation; transition task to CANCELLED and cancel checkpoints."""
         clean_session = session_id.strip()
         success, err = await reject_approval(task_id, clean_session)
+        await checkpoint_manager.cancel_pending_checkpoints(task_id, clean_session)
         task = await self.get_task(clean_session, task_id)
 
         reply = "Operation rejected. No persistent changes were made." if success else f"Rejection error: {err}"
+        checkpoints = await checkpoint_manager.get_task_checkpoints(task_id, clean_session)
+        if task:
+            task.checkpoints = checkpoints
         return AgentTaskResponse(
             task=task,
-            reply=reply
+            reply=reply,
+            checkpoints=checkpoints
         )
 
+    async def cancel_task(
+        self,
+        session_id: str,
+        task_id: UUID
+    ) -> AgentTaskResponse:
+        """Cancel an in-flight, awaiting_approval, or paused task safely."""
+        clean_session = session_id.strip()
+        task = await self.get_task(clean_session, task_id)
+        if not task:
+            raise ValueError("Task not found or access denied for this session.")
+
+        # Reject requests to cancel terminal tasks
+        if task.status in (TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            logger.warning(f"Rejecting cancellation request: task {task_id} is in terminal state '{task.status.value}'.")
+            checkpoints = await checkpoint_manager.get_task_checkpoints(task_id, clean_session)
+            task.checkpoints = checkpoints
+            return AgentTaskResponse(
+                task=task,
+                reply=f"Cannot cancel task in terminal state: {task.status.value}.",
+                checkpoints=checkpoints
+            )
+
+        active_task = self._active_tasks.get(task_id)
+        if active_task and not active_task.done():
+            task.status = TaskStatus.CANCEL_REQUESTED
+            await self._update_task_record(task)
+            active_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(active_task), timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+            refreshed = await self.get_task(clean_session, task_id)
+            if refreshed:
+                task = refreshed
+            checkpoints = await checkpoint_manager.get_task_checkpoints(task_id, clean_session)
+            task.checkpoints = checkpoints
+            return AgentTaskResponse(
+                task=task,
+                reply=task.result_summary or f"Task transitioned to {task.status.value}.",
+                checkpoints=checkpoints
+            )
+
+        task.status = TaskStatus.CANCELLED
+        task.completed_at = datetime.now(timezone.utc)
+        task.result_summary = "Task was cancelled by user."
+        await checkpoint_manager.cancel_pending_checkpoints(task_id, clean_session)
+        await self._update_task_record(task)
+        checkpoints = await checkpoint_manager.get_task_checkpoints(task_id, clean_session)
+        task.checkpoints = checkpoints
+        return AgentTaskResponse(
+            task=task,
+            reply="Task execution was cancelled successfully.",
+            checkpoints=checkpoints
+        )
+
+    async def retry_task(
+        self,
+        session_id: str,
+        task_id: UUID
+    ) -> AgentTaskResponse:
+        """Resume execution of a failed, paused, or reconciled task from its last checkpoint."""
+        clean_session = session_id.strip()
+        task = await self.get_task(clean_session, task_id)
+        if not task or not task.plan:
+            raise ValueError("Task or plan could not be restored for retry.")
+
+        # Reopen failed, retrying, or needs_reconciliation steps
+        for step in task.plan.steps:
+            if step.status in (StepStatus.FAILED, StepStatus.RETRYING, StepStatus.NEEDS_RECONCILIATION, StepStatus.SKIPPED):
+                step.status = StepStatus.PENDING
+                step.error = None
+                step.error_classification = None
+
+        task.status = TaskStatus.RUNNING
+        task.result_summary = None
+        task.completed_at = None
+        await self._update_task_record(task)
+        return await self._execute_plan_steps(task)
+
     async def get_task(self, session_id: str, task_id: UUID) -> Optional[AgentTask]:
-        """Fetch an agent task by ID ensuring strict session ownership."""
+        """Fetch an agent task by ID ensuring strict session ownership and loading checkpoints."""
         pool = await get_db_pool()
         if pool is None:
             return None
@@ -346,6 +829,8 @@ class AgentOrchestrator:
                 """
                 SELECT id, session_id, user_request, task_type, plan_json, status,
                        result_summary, approval_token, approval_status, approval_expires_at,
+                       estimated_complexity, estimated_cost_tier, requires_clarification, clarification_prompt,
+                       lease_generation, worker_id, last_heartbeat_at, execution_lease_expires_at,
                        created_at, updated_at, completed_at
                 FROM agent_tasks
                 WHERE id = $1 AND session_id = $2
@@ -365,7 +850,6 @@ class AgentOrchestrator:
                     logger.warning(f"Could not deserialize plan_json: {e}")
 
             # Reconstruct pending approval if still awaiting
-            # Reconstruct pending approval if still awaiting
             pending_req = None
             if row["status"] == TaskStatus.AWAITING_APPROVAL.value:
                 if plan_obj:
@@ -377,11 +861,12 @@ class AgentOrchestrator:
                                 tool_name=s.tool_name or "create_note",
                                 arguments=s.arguments
                             )
-                            # Never expose token from historical queries
                             pending_req.approval_token = "[REDACTED_HISTORICAL_TOKEN]"
                             if row["approval_expires_at"]:
                                 pending_req.expires_at = row["approval_expires_at"]
                             break
+
+            checkpoints = await checkpoint_manager.get_task_checkpoints(task_id, session_id.strip())
 
             return AgentTask(
                 id=row["id"],
@@ -395,6 +880,15 @@ class AgentOrchestrator:
                 approval_status=row["approval_status"],
                 approval_expires_at=row["approval_expires_at"],
                 pending_approval=pending_req,
+                estimated_complexity=row.get("estimated_complexity") or "low",
+                estimated_cost_tier=row.get("estimated_cost_tier") or "standard",
+                requires_clarification=bool(row.get("requires_clarification", False)),
+                clarification_prompt=row.get("clarification_prompt"),
+                lease_generation=row.get("lease_generation") or 1,
+                worker_id=row.get("worker_id"),
+                last_heartbeat_at=row.get("last_heartbeat_at"),
+                execution_lease_expires_at=row.get("execution_lease_expires_at"),
+                checkpoints=checkpoints,
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 completed_at=row["completed_at"]
@@ -411,6 +905,7 @@ class AgentOrchestrator:
                 """
                 SELECT id, session_id, user_request, task_type, plan_json, status,
                        result_summary, approval_token, approval_status, approval_expires_at,
+                       estimated_complexity, estimated_cost_tier, requires_clarification, clarification_prompt,
                        created_at, updated_at, completed_at
                 FROM agent_tasks
                 WHERE session_id = $1
@@ -442,6 +937,10 @@ class AgentOrchestrator:
                         approval_token=None,
                         approval_status=r["approval_status"],
                         approval_expires_at=r["approval_expires_at"],
+                        estimated_complexity=r.get("estimated_complexity") or "low",
+                        estimated_cost_tier=r.get("estimated_cost_tier") or "standard",
+                        requires_clarification=bool(r.get("requires_clarification", False)),
+                        clarification_prompt=r.get("clarification_prompt"),
                         created_at=r["created_at"],
                         updated_at=r["updated_at"],
                         completed_at=r["completed_at"]
@@ -485,45 +984,106 @@ class AgentOrchestrator:
                 for r in rows
             ]
 
+    async def claim_task_lease(
+        self,
+        task_id: UUID,
+        session_id: str,
+        worker_id: Optional[str] = None,
+        lease_seconds: int = 60
+    ) -> Tuple[bool, int, Optional[str]]:
+        """
+        Sprint 3.1: Monotonically increasing fencing token (lease_generation) lease claim.
+        Conditional database update requiring the task to be unassigned, expired, or already owned.
+        """
+        pool = await get_db_pool()
+        if pool is None:
+            return False, 0, "Database pool unavailable."
+
+        eff_worker_id = worker_id or WorkerIdentity.get_worker_id()
+        now_utc = datetime.now(timezone.utc)
+        expires_at = now_utc + timedelta(seconds=lease_seconds)
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE agent_tasks
+                SET worker_id = $1,
+                    lease_generation = COALESCE(lease_generation, 0) + 1,
+                    last_heartbeat_at = $2,
+                    execution_lease_expires_at = $3,
+                    status = CASE WHEN status = 'awaiting_approval' THEN 'awaiting_approval' ELSE 'running' END,
+                    updated_at = NOW()
+                WHERE id = $4 AND session_id = $5
+                  AND (
+                      execution_lease_expires_at IS NULL
+                      OR execution_lease_expires_at < NOW()
+                      OR worker_id = $1
+                      OR status IN ('proposed', 'awaiting_approval')
+                  )
+                RETURNING lease_generation;
+                """,
+                eff_worker_id,
+                now_utc,
+                expires_at,
+                task_id,
+                session_id.strip()
+            )
+            if row:
+                gen = row["lease_generation"]
+                logger.info(f"Worker {eff_worker_id} successfully claimed lease on task {task_id} with fencing generation {gen}.")
+                return True, gen, None
+
+            cur = await conn.fetchrow(
+                "SELECT worker_id, lease_generation, execution_lease_expires_at, status FROM agent_tasks WHERE id = $1",
+                task_id
+            )
+            if cur:
+                return False, cur["lease_generation"] or 0, f"Task lease held by active worker {cur['worker_id']} until {cur['execution_lease_expires_at']}."
+            return False, 0, "Task not found."
+
     async def renew_heartbeat(
         self,
         task_id: UUID,
         session_id: str,
+        worker_id: Optional[str] = None,
+        lease_generation: Optional[int] = None,
+        lease_seconds: Optional[int] = None,
         lease_minutes: Optional[int] = None
     ) -> bool:
         """
-        Day 7.2: Renewable execution heartbeat.
-        Extends task lease and timestamps the active worker heartbeat in Neon PostgreSQL.
+        Sprint 3.1: Renewable execution heartbeat with fencing token enforcement.
+        Extends task lease only if worker_id and lease_generation match the current lease.
         """
         pool = await get_db_pool()
         if pool is None:
             return False
 
-        worker_id = WorkerIdentity.get_worker_id()
-        lease_duration = lease_minutes or getattr(settings, "WORKER_LEASE_MINUTES", 5)
+        eff_worker_id = worker_id or WorkerIdentity.get_worker_id()
+        duration_sec = lease_seconds if lease_seconds is not None else (lease_minutes * 60 if lease_minutes is not None else getattr(settings, "WORKER_LEASE_MINUTES", 5) * 60)
         now_utc = datetime.now(timezone.utc)
-        expires_at = now_utc + timedelta(minutes=lease_duration)
+        expires_at = now_utc + timedelta(seconds=duration_sec)
+
+        query = """
+            UPDATE agent_tasks
+            SET last_heartbeat_at = $1,
+                execution_lease_expires_at = $2,
+                updated_at = NOW()
+            WHERE id = $3 AND session_id = $4 AND worker_id = $5
+              AND status IN ('running', 'cancel_requested')
+        """
+        params = [now_utc, expires_at, task_id, session_id.strip(), eff_worker_id]
+
+        if lease_generation is not None:
+            query += " AND lease_generation = $6"
+            params.append(lease_generation)
 
         async with pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE agent_tasks
-                SET last_heartbeat_at = $1,
-                    execution_lease_expires_at = $2,
-                    worker_id = $3,
-                    updated_at = NOW()
-                WHERE id = $4 AND session_id = $5 AND status = 'running'
-                """,
-                now_utc,
-                expires_at,
-                worker_id,
-                task_id,
-                session_id.strip()
-            )
+            result = await conn.execute(query, *params)
             count = int(result.split()[-1]) if result else 0
             if count > 0:
-                logger.debug(f"Heartbeat renewed for task {task_id} by worker {worker_id} (lease valid until {expires_at}).")
+                logger.debug(f"Heartbeat renewed for task {task_id} by worker {eff_worker_id} (lease valid until {expires_at}).")
                 return True
+            logger.warning(f"Failed to renew heartbeat for task {task_id}: worker {eff_worker_id} or lease_generation {lease_generation} is stale.")
             return False
 
     async def _persist_new_task(self, task: AgentTask) -> None:
@@ -539,6 +1099,12 @@ class AgentOrchestrator:
         last_heartbeat_at = now_utc if is_running else None
         lease_minutes = getattr(settings, "WORKER_LEASE_MINUTES", 5)
         execution_lease_expires_at = (now_utc + timedelta(minutes=lease_minutes)) if is_running else None
+        lease_gen = getattr(task, "lease_generation", 1) or 1
+
+        complexity = task.estimated_complexity or (task.plan.estimated_complexity if task.plan else "low")
+        cost_tier = task.estimated_cost_tier or (task.plan.estimated_cost_tier if task.plan else "standard")
+        req_clar = bool(task.requires_clarification or (task.plan.requires_clarification if task.plan else False))
+        clar_prompt = task.clarification_prompt or (task.plan.clarification_prompt if task.plan else None)
 
         async with pool.acquire() as conn:
             await conn.execute(
@@ -546,14 +1112,16 @@ class AgentOrchestrator:
                 INSERT INTO agent_tasks (
                     id, session_id, user_request, task_type, plan_json, status,
                     result_summary, approval_token, approval_status, approval_expires_at,
-                    worker_id, last_heartbeat_at, execution_lease_expires_at,
+                    worker_id, last_heartbeat_at, execution_lease_expires_at, lease_generation,
+                    estimated_complexity, estimated_cost_tier, requires_clarification, clarification_prompt,
                     created_at, updated_at, completed_at
                 )
                 VALUES (
                     $1, $2, $3, $4, $5::jsonb, $6,
                     $7, $8, $9, $10,
-                    $11, $12, $13,
-                    $14, $15, $16
+                    $11, $12, $13, $14,
+                    $15, $16, $17, $18,
+                    $19, $20, $21
                 )
                 """,
                 task.id,
@@ -569,13 +1137,23 @@ class AgentOrchestrator:
                 worker_id,
                 last_heartbeat_at,
                 execution_lease_expires_at,
+                lease_gen,
+                complexity,
+                cost_tier,
+                req_clar,
+                clar_prompt,
                 task.created_at,
                 task.updated_at,
                 task.completed_at,
             )
 
-    async def _update_task_record(self, task: AgentTask) -> None:
-        """Update existing task state in agent_tasks with execution lease tracking."""
+    async def _update_task_record(
+        self,
+        task: AgentTask,
+        worker_id: Optional[str] = None,
+        lease_generation: Optional[int] = None
+    ) -> None:
+        """Update existing task state in agent_tasks with execution lease and fencing token tracking."""
         pool = await get_db_pool()
         if pool is None:
             return
@@ -583,13 +1161,19 @@ class AgentOrchestrator:
         plan_json_str = task.plan.model_dump_json() if task.plan else None
         now_utc = datetime.now(timezone.utc)
         is_running = (task.status == TaskStatus.RUNNING)
-        worker_id = WorkerIdentity.get_worker_id() if is_running else None
+        eff_worker_id = worker_id or (WorkerIdentity.get_worker_id() if is_running else None)
         last_heartbeat_at = now_utc if is_running else None
         lease_minutes = getattr(settings, "WORKER_LEASE_MINUTES", 5)
         execution_lease_expires_at = (now_utc + timedelta(minutes=lease_minutes)) if is_running else None
+        eff_lease_gen = lease_generation or getattr(task, "lease_generation", 1)
+
+        complexity = task.estimated_complexity or (task.plan.estimated_complexity if task.plan else "low")
+        cost_tier = task.estimated_cost_tier or (task.plan.estimated_cost_tier if task.plan else "standard")
+        req_clar = bool(task.requires_clarification or (task.plan.requires_clarification if task.plan else False))
+        clar_prompt = task.clarification_prompt or (task.plan.clarification_prompt if task.plan else None)
 
         async with pool.acquire() as conn:
-            await conn.execute(
+            row = await conn.fetchrow(
                 """
                 UPDATE agent_tasks
                 SET plan_json = $1::jsonb,
@@ -597,25 +1181,52 @@ class AgentOrchestrator:
                     result_summary = $3,
                     approval_status = $4,
                     approval_expires_at = $5,
-                    worker_id = $6,
+                    worker_id = COALESCE($6, worker_id),
                     last_heartbeat_at = $7,
                     execution_lease_expires_at = $8,
+                    estimated_complexity = $9,
+                    estimated_cost_tier = $10,
+                    requires_clarification = $11,
+                    clarification_prompt = $12,
+                    lease_generation = COALESCE($13, lease_generation),
                     updated_at = NOW(),
-                    completed_at = $9
-                WHERE id = $10 AND session_id = $11
+                    completed_at = $14
+                WHERE id = $15 AND session_id = $16
+                  AND (
+                      $13::int IS NULL
+                      OR lease_generation IS NULL
+                      OR lease_generation <= $13::int
+                  )
+                RETURNING lease_generation;
                 """,
                 plan_json_str,
                 task.status.value,
                 task.result_summary,
                 task.approval_status,
                 task.approval_expires_at,
-                worker_id,
+                eff_worker_id,
                 last_heartbeat_at,
                 execution_lease_expires_at,
+                complexity,
+                cost_tier,
+                req_clar,
+                clar_prompt,
+                eff_lease_gen,
                 task.completed_at,
                 task.id,
                 task.session_id,
             )
+            if not row and eff_lease_gen:
+                cur = await conn.fetchrow("SELECT lease_generation, worker_id FROM agent_tasks WHERE id = $1", task.id)
+                if cur and cur["lease_generation"] and cur["lease_generation"] > eff_lease_gen:
+                    logger.error(
+                        f"Fencing violation: Worker {eff_worker_id} (gen={eff_lease_gen}) attempted updating task {task.id}, "
+                        f"but active DB generation is {cur['lease_generation']}."
+                    )
+                    raise StaleWorkerError(
+                        f"Stale worker update rejected on task {task.id}: current generation is {cur['lease_generation']}, "
+                        f"attempted with {eff_lease_gen}."
+                    )
 
 # Global orchestrator singleton
 orchestrator = AgentOrchestrator()

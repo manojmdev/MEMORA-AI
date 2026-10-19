@@ -12,7 +12,18 @@ from app.schemas import (
     MemoryListResponse,
     MemoryRecord,
     ScoredMemoryRecord,
-    DeleteResponse
+    DeleteResponse,
+    CreateRelationshipRequest,
+    MemoryRelationshipRecord,
+    ConnectedMemoryNode,
+    MemoryGraphResponse,
+    ConsolidationPreviewResponse,
+    ApplyConsolidationRequest,
+    ApplyConsolidationResponse,
+    MemoryLifecycleEventRecord,
+    MemoryLifecycleStats,
+    MemoryExplanationResponse,
+    MemoryDashboardStats,
 )
 from app.services.memory_context import generate_personalized_response
 from app.services.memory_service import (
@@ -25,16 +36,24 @@ from app.services.memory_service import (
 from app.services.hybrid_retriever import retrieve_hybrid_memories
 from app.services.semantic_retriever import default_semantic_retriever
 from app.services.memory_retriever import default_retriever as keyword_retriever
+from app.services.relationship_service import relationship_service
+from app.services.consolidation_service import consolidation_service
+from app.services.context_retriever import context_retriever
+from app.services.lifecycle_service import lifecycle_service
+from app.services.explainability_service import explainability_service
+from app.services.dashboard_service import dashboard_service
 from app.agent.models import (
     AgentRunRequest,
     AgentTaskResponse,
     ApprovalActionRequest,
     AgentTask,
+    AgentTaskCheckpoint,
     AgentExecutionEvent,
     NoteRecord,
     NoteListResponse,
 )
 from app.agent.orchestrator import agent_orchestrator
+from app.agent.checkpoint_manager import checkpoint_manager
 from app.services import note_service
 from app.database import init_db_pool, close_db_pool, check_db_health, recover_interrupted_tasks
 from app.auth.session_guard import validate_session_id, get_current_principal, UserPrincipal
@@ -427,6 +446,74 @@ async def reject_agent_task(
     except Exception as e:
         raise safe_internal_error(e, "Rejection handling failed", req)
 
+@app.post("/api/agent/tasks/{task_id}/cancel", response_model=AgentTaskResponse)
+async def cancel_agent_task(
+    task_id: UUID,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """
+    Safely cancels an in-progress or pending agent task and its remaining checkpoints.
+    Does not delete or alter already-completed checkpoints or execution audit history.
+    """
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        return await agent_orchestrator.cancel_task(
+            session_id=valid_sid,
+            task_id=task_id
+        )
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Task cancellation failed", req)
+
+@app.post("/api/agent/tasks/{task_id}/retry", response_model=AgentTaskResponse)
+async def retry_agent_task(
+    task_id: UUID,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """
+    Resumes or retries an agent task from the last failed or pending checkpoint.
+    Already-succeeded steps are preserved and not re-executed.
+    """
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        return await agent_orchestrator.retry_task(
+            session_id=valid_sid,
+            task_id=task_id
+        )
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Task retry failed", req)
+
+@app.get("/api/agent/tasks/{task_id}/checkpoints", response_model=List[AgentTaskCheckpoint])
+async def get_agent_task_checkpoints(
+    task_id: UUID,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Fetch durable step-level checkpoints for an agent task."""
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        return await checkpoint_manager.get_task_checkpoints(task_id=task_id, session_id=valid_sid)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to fetch task checkpoints", req)
+
 @app.get("/api/agent/tasks/{task_id}/logs", response_model=List[AgentExecutionEvent])
 async def get_agent_task_logs(
     task_id: UUID,
@@ -486,5 +573,407 @@ async def delete_user_note(
         raise
     except Exception as e:
         raise safe_internal_error(e, "Failed to delete note", req)
+
+# ==============================================================================
+# SPRINT 2: ADVANCED MEMORY INTELLIGENCE 2.0 ENDPOINTS
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Phase 1: Memory Relationship Graph
+# ------------------------------------------------------------------------------
+
+@app.post("/api/memories/relationships", response_model=MemoryRelationshipRecord)
+async def create_memory_relationship(
+    request: CreateRelationshipRequest,
+    req: Request,
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Create a directional typed relationship between two memories in a session."""
+    valid_sid = validate_session_id(request.session_id, principal)
+    try:
+        rel = await relationship_service.create_relationship(
+            session_id=valid_sid,
+            source_memory_id=request.source_memory_id,
+            target_memory_id=request.target_memory_id,
+            relationship_type=request.relationship_type,
+            strength=request.strength,
+            metadata=request.metadata,
+        )
+        return rel
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to create memory relationship", req)
+
+@app.get("/api/memories/relationships", response_model=List[MemoryRelationshipRecord])
+async def list_memory_relationships(
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    source_id: Optional[UUID] = Query(None, description="Filter by source memory ID"),
+    target_id: Optional[UUID] = Query(None, description="Filter by target memory ID"),
+    relationship_type: Optional[str] = Query(None, description="Filter by relationship type"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """List relationships for a session with optional node/type filtering."""
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        return await relationship_service.list_relationships(
+            session_id=valid_sid,
+            source_id=source_id,
+            target_id=target_id,
+            relationship_type=relationship_type,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to list memory relationships", req)
+
+@app.delete("/api/memories/relationships/{relationship_id}", response_model=DeleteResponse)
+async def delete_memory_relationship(
+    relationship_id: UUID,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Delete a specific memory relationship edge."""
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        deleted = await relationship_service.delete_relationship(
+            session_id=valid_sid,
+            relationship_id=relationship_id,
+        )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Relationship not found or does not belong to session.")
+        return DeleteResponse(
+            session_id=valid_sid,
+            message="Relationship deleted successfully.",
+            deleted_count=1,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to delete relationship", req)
+
+@app.get("/api/memories/{memory_id}/connected", response_model=List[ConnectedMemoryNode])
+async def get_connected_memories(
+    memory_id: UUID,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    depth: int = Query(default=1, ge=1, le=2, description="Hop depth (1 or 2)"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Traverse relationships connected to a specific memory node."""
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        return await relationship_service.get_connected_memories(
+            session_id=valid_sid,
+            memory_id=memory_id,
+            depth=depth,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to get connected memories", req)
+
+@app.get("/api/memories/graph", response_model=MemoryGraphResponse)
+async def get_session_memory_graph(
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Retrieve full relationship graph topology (nodes and edges) for a session."""
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        return await relationship_service.get_session_graph(session_id=valid_sid)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to retrieve session graph", req)
+
+# ------------------------------------------------------------------------------
+# Phase 2: Intelligent Memory Consolidation
+# ------------------------------------------------------------------------------
+
+@app.post("/api/memories/consolidation/preview", response_model=ConsolidationPreviewResponse)
+async def preview_memory_consolidation(
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    similarity_threshold: float = Query(default=0.75, ge=0.50, le=0.99),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """
+    Identify semantically overlapping memories and generate candidate consolidation proposals.
+    Non-destructive preview only; does not modify any database records.
+    """
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        return await consolidation_service.preview_consolidation(
+            session_id=valid_sid,
+            similarity_threshold=similarity_threshold,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to preview memory consolidation", req)
+
+@app.post("/api/memories/consolidation/apply", response_model=ApplyConsolidationResponse)
+async def apply_memory_consolidation(
+    request: ApplyConsolidationRequest,
+    req: Request,
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """
+    Apply a reviewed consolidation proposal: atomically creates a consolidated memory,
+    transitions source memories to 'consolidated' status, creates lineage relationships,
+    and logs governance lifecycle audit events.
+    """
+    valid_sid = validate_session_id(request.session_id, principal)
+    try:
+        return await consolidation_service.apply_consolidation(
+            session_id=valid_sid,
+            source_memory_ids=request.source_memory_ids,
+            consolidated_content=request.consolidated_content,
+            cluster_topic=request.cluster_topic,
+            rationale=request.rationale,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to apply consolidation", req)
+
+# ------------------------------------------------------------------------------
+# Phase 3: Context-Aware Retrieval 2.0
+# ------------------------------------------------------------------------------
+
+@app.get("/api/memories/search/v2", response_model=List[ScoredMemoryRecord])
+async def search_context_memories_v2(
+    query: str = Query(..., description="Search query or context prompt"),
+    req: Request = None,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    limit: int = Query(default=5, ge=1, le=20, description="Max memories to return"),
+    category: Optional[str] = Query(None, description="Filter by category"),
+    include_archived: bool = Query(default=False, description="Whether to include cold-storage archived memories"),
+    debug_scores: bool = Query(default=True, description="Include detailed scoring breakdown"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """
+    Context-Aware Retrieval 2.0:
+    Multi-factor ranking incorporating semantic similarity (pgvector cosine), exact keyword matching,
+    memory importance, confidence, asymptotic time-decay, and relationship graph proximity boost.
+    """
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        return await context_retriever.retrieve_context_aware(
+            session_id=valid_sid,
+            query=query,
+            limit=limit,
+            category=category,
+            include_archived=include_archived,
+            debug_scores=debug_scores,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Context-Aware Retrieval 2.0 failed", req)
+
+# ------------------------------------------------------------------------------
+# Phase 4: Memory Lifecycle Management
+# ------------------------------------------------------------------------------
+
+@app.post("/api/memories/{memory_id}/archive", response_model=MemoryRecord)
+async def archive_memory(
+    memory_id: UUID,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    reason: str = Query(default="Archived by user", description="Reason for archival"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Move a memory to cold storage archive. Preserved but excluded from active searches."""
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        rec = await lifecycle_service.archive_memory(
+            session_id=valid_sid,
+            memory_id=memory_id,
+            reason=reason,
+            actor=principal.principal_id,
+        )
+        if not rec:
+            raise HTTPException(status_code=404, detail="Memory not found or does not belong to session.")
+        return rec
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to archive memory", req)
+
+@app.post("/api/memories/{memory_id}/restore", response_model=MemoryRecord)
+async def restore_memory(
+    memory_id: UUID,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    reason: str = Query(default="Restored by user", description="Reason for restoration"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Restore an archived memory back into active retrieval."""
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        rec = await lifecycle_service.restore_memory(
+            session_id=valid_sid,
+            memory_id=memory_id,
+            reason=reason,
+            actor=principal.principal_id,
+        )
+        if not rec:
+            raise HTTPException(status_code=404, detail="Memory not found or does not belong to session.")
+        return rec
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to restore memory", req)
+
+@app.post("/api/memories/{memory_id}/forget", response_model=DeleteResponse)
+async def forget_memory(
+    memory_id: UUID,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    reason: str = Query(default="User requested forgetting", description="Reason for forgetting"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """
+    Immediately deactivates memory, removes from active retrieval, and completely nullifies
+    its vector embedding. Minimal lifecycle governance audit entry preserved.
+    """
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        success = await lifecycle_service.forget_memory(
+            session_id=valid_sid,
+            memory_id=memory_id,
+            reason=reason,
+            actor=principal.principal_id,
+        )
+        if not success:
+            raise HTTPException(status_code=404, detail="Memory not found or does not belong to session.")
+        return DeleteResponse(
+            session_id=valid_sid,
+            message="Memory forgotten successfully. Embedding vector cleared immediately.",
+            deleted_count=1,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to forget memory", req)
+
+@app.post("/api/memories/retention/check")
+async def check_memory_retention(
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Scan and transition expired memories based on temporal validity TTL timestamps."""
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        expired = await lifecycle_service.check_and_expire_retention(session_id=valid_sid)
+        return {
+            "session_id": valid_sid,
+            "expired_count": len(expired),
+            "expired_memory_ids": [str(eid) for eid in expired],
+            "message": f"Successfully evaluated retention policy. {len(expired)} memories transitioned to expired.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to evaluate retention policy", req)
+
+@app.get("/api/memories/lifecycle", response_model=List[MemoryLifecycleEventRecord])
+async def list_lifecycle_events(
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    memory_id: Optional[UUID] = Query(None, description="Filter events for a specific memory"),
+    limit: int = Query(default=50, ge=1, le=100),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Retrieve immutable lifecycle event audit trail for governance and compliance."""
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        return await lifecycle_service.get_lifecycle_history(
+            session_id=valid_sid,
+            memory_id=memory_id,
+            limit=limit,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to fetch lifecycle events", req)
+
+@app.get("/api/memories/lifecycle/stats", response_model=MemoryLifecycleStats)
+async def get_lifecycle_stats(
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Get aggregated lifecycle metrics for memories in a session."""
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        return await lifecycle_service.get_lifecycle_stats(session_id=valid_sid)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to fetch lifecycle stats", req)
+
+# ------------------------------------------------------------------------------
+# Phase 5: Memory Explainability
+# ------------------------------------------------------------------------------
+
+@app.get("/api/memories/{memory_id}/explain", response_model=MemoryExplanationResponse)
+async def explain_memory_decision(
+    memory_id: UUID,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """
+    Return structured, transparent explanation of why a memory was extracted,
+    why it is retained, its inference nature, source evidence, and relationship lineage.
+    """
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        explanation = await explainability_service.explain_memory(
+            session_id=valid_sid,
+            memory_id=memory_id,
+        )
+        if not explanation:
+            raise HTTPException(status_code=404, detail="Memory not found or does not belong to session.")
+        return explanation
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to explain memory decision", req)
+
+# ------------------------------------------------------------------------------
+# Phase 6: Memory Health Dashboard
+# ------------------------------------------------------------------------------
+
+@app.get("/api/memories/dashboard", response_model=MemoryDashboardStats)
+async def get_memory_dashboard_metrics(
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """
+    Aggregate live, verified database metrics for the Memory Health Dashboard:
+    status counts, temporal distributions, category breakdown, graph size,
+    consolidation count, evolution timeline, and retrieval performance.
+    """
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        return await dashboard_service.get_dashboard_stats(session_id=valid_sid)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Failed to generate dashboard metrics", req)
+
 
 

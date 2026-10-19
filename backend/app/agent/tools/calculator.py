@@ -116,6 +116,28 @@ def _eval_ast(node: ast.AST) -> Union[int, float]:
     else:
         raise ValueError(f"Disallowed expression node: {type(node).__name__}")
 
+from pydantic import BaseModel, Field, field_validator
+
+class CalculatorArgs(BaseModel):
+    expression: str = Field(..., max_length=MAX_EXPRESSION_LENGTH, description="Mathematical expression string")
+
+    @field_validator("expression")
+    @classmethod
+    def validate_expression_syntax(cls, v: str) -> str:
+        clean = v.strip()
+        if not clean:
+            raise ValueError("Expression must not be empty.")
+        # Disallow dangerous script tokens
+        disallowed = ["import", "exec", "eval", "__", "os.", "sys.", "lambda", "class", "def", ";"]
+        if any(d in clean.lower() for d in disallowed):
+            raise ValueError("Disallowed tokens detected in mathematical expression.")
+        try:
+            parsed = ast.parse(clean, mode="eval")
+            _validate_ast_limits(parsed)
+        except Exception as e:
+            raise ValueError(f"Invalid mathematical syntax: {e}")
+        return clean
+
 class CalculatorTool(BaseTool):
     name = "calculator"
     description = (
@@ -123,6 +145,10 @@ class CalculatorTool(BaseTool):
         "Accepts an 'expression' string (e.g., '(15 * 4) + 20' or '1024 / 8')."
     )
     permission = ToolPermission.AUTOMATIC
+    is_idempotent = True
+    category = "computation"
+    risk_level = "safe_compute"
+    args_schema = CalculatorArgs
 
     async def execute(self, session_id: str, **kwargs) -> Dict[str, Any]:
         """Execute arithmetic calculation securely without eval."""

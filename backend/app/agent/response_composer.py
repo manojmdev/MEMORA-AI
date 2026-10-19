@@ -48,15 +48,17 @@ def compose_agent_response(
         if s.tool_name:
             tools_used.add(s.tool_name)
         status_icon = "✅" if s.status == StepStatus.SUCCEEDED else "⏳"
-        if s.tool_name == "calculator" and s.result:
+        if s.tool_name == "calculator" and isinstance(s.result, dict):
             step_summaries.append(f"- {status_icon} **Calculation:** `{s.result.get('expression')}` = **{s.result.get('result')}**")
-        elif s.tool_name == "create_note" and s.result:
+        elif s.tool_name == "calculator" and s.result:
+            step_summaries.append(f"- {status_icon} **Calculation:** `{s.result}`")
+        elif s.tool_name == "create_note" and isinstance(s.result, dict):
             step_summaries.append(f"- {status_icon} **Saved Note:** '{s.result.get('title')}'")
-        elif s.tool_name == "generate_study_plan" and s.result:
+        elif s.tool_name == "generate_study_plan" and isinstance(s.result, dict):
             subj = s.result.get('subject', 'Study Plan')
             days = s.result.get('total_days', '')
             step_summaries.append(f"- {status_icon} **Curriculum:** Generated {days}-day plan for *{subj}*.")
-        elif s.tool_name == "search_memories" and s.result:
+        elif s.tool_name == "search_memories" and isinstance(s.result, dict):
             step_summaries.append(f"- {status_icon} **Memory Search:** Found {s.result.get('count', 0)} matching memories.")
         else:
             step_summaries.append(f"- {status_icon} {s.description}")

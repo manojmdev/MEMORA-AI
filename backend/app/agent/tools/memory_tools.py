@@ -8,6 +8,16 @@ from app.agent.tools.base import BaseTool
 from app.services.hybrid_retriever import retrieve_hybrid_memories
 from app.services.memory_service import list_memories
 
+from pydantic import BaseModel, Field
+
+class SearchMemoriesArgs(BaseModel):
+    query: str = Field(..., min_length=1, max_length=500, description="Search query string")
+    category: Optional[str] = Field(default=None, max_length=100, description="Optional category filter")
+    limit: Optional[int] = Field(default=5, ge=1, le=20, description="Max memories to return")
+
+class ListMemoriesArgs(BaseModel):
+    category: Optional[str] = Field(default=None, max_length=100, description="Optional category filter")
+
 class SearchMemoriesTool(BaseTool):
     name = "search_memories"
     description = (
@@ -15,6 +25,10 @@ class SearchMemoriesTool(BaseTool):
         "Arguments: 'query' (string, required), 'category' (string, optional), 'limit' (int, optional, default 5)."
     )
     permission = ToolPermission.AUTOMATIC
+    is_idempotent = True
+    category = "memory"
+    risk_level = "safe_readonly"
+    args_schema = SearchMemoriesArgs
 
     async def execute(self, session_id: str, **kwargs) -> Dict[str, Any]:
         query = kwargs.get("query")
@@ -64,6 +78,10 @@ class ListMemoriesTool(BaseTool):
         "Arguments: 'category' (string, optional - e.g. 'skills', 'preferences', 'projects', 'goals')."
     )
     permission = ToolPermission.AUTOMATIC
+    is_idempotent = True
+    category = "memory"
+    risk_level = "safe_readonly"
+    args_schema = ListMemoriesArgs
 
     async def execute(self, session_id: str, **kwargs) -> Dict[str, Any]:
         category = kwargs.get("category")

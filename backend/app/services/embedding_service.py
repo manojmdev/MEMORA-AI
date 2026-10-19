@@ -20,9 +20,13 @@ def get_embedding_client() -> AsyncOpenAI:
         )
     return _client
 
-# Simple in-memory LRU-like cache for frequent query embeddings (session-agnostic queries)
-_query_embedding_cache: dict[str, List[float]] = {}
-_MAX_CACHE_ENTRIES = 256
+import hashlib
+
+# Simple in-memory LRU-like cache for frequent embeddings (session-agnostic)
+_embedding_cache: dict[str, List[float]] = {}
+_MAX_CACHE_ENTRIES = 512
+_in_flight_locks: dict[str, asyncio.Event] = {}
+_in_flight_results: dict[str, Optional[List[float]]] = {}
 
 def vector_to_sql_str(embedding: List[float]) -> str:
     """Format a list of floats into a PostgreSQL vector string representation: '[0.1,0.2,...]'."""
@@ -31,17 +35,26 @@ def vector_to_sql_str(embedding: List[float]) -> str:
 async def generate_embedding(text: str, is_query: bool = False) -> Optional[List[float]]:
     """
     Generate a normalized embedding vector for a given text using the configured Nebius model.
-    Validates output dimension, handles timeouts, and protects credentials.
+    Validates output dimension, handles timeouts, and deduplicates in-flight identical requests.
     """
     if not text or not text.strip():
         return None
 
     cleaned_text = text.strip()
+    cache_key = hashlib.sha256(cleaned_text.encode("utf-8")).hexdigest()
 
-    # Query embedding cache check
-    if is_query and cleaned_text in _query_embedding_cache:
-        return _query_embedding_cache[cleaned_text]
+    # Fast in-memory cache hit
+    if cache_key in _embedding_cache:
+        return _embedding_cache[cache_key]
 
+    # In-flight deduplication: if an identical request is currently active, await its outcome
+    if cache_key in _in_flight_locks:
+        await _in_flight_locks[cache_key].wait()
+        return _in_flight_results.get(cache_key)
+
+    # Register in-flight gate for concurrent callers
+    event = asyncio.Event()
+    _in_flight_locks[cache_key] = event
     client = get_embedding_client()
 
     try:
@@ -53,6 +66,7 @@ async def generate_embedding(text: str, is_query: bool = False) -> Optional[List
 
         if not response.data or not response.data[0].embedding:
             logger.warning("Embedding service returned empty response data.")
+            _in_flight_results[cache_key] = None
             return None
 
         embedding = response.data[0].embedding
@@ -63,20 +77,20 @@ async def generate_embedding(text: str, is_query: bool = False) -> Optional[List
                 f"Vector dimension mismatch: expected {settings.EMBEDDING_DIMENSION}, "
                 f"got {len(embedding)}. Discarding invalid vector."
             )
+            _in_flight_results[cache_key] = None
             return None
 
-        # Cache if query
-        if is_query:
-            if len(_query_embedding_cache) >= _MAX_CACHE_ENTRIES:
-                # Evict oldest entry
-                oldest_key = next(iter(_query_embedding_cache))
-                del _query_embedding_cache[oldest_key]
-            _query_embedding_cache[cleaned_text] = embedding
-
+        # Store in LRU cache
+        if len(_embedding_cache) >= _MAX_CACHE_ENTRIES:
+            oldest_key = next(iter(_embedding_cache))
+            del _embedding_cache[oldest_key]
+        _embedding_cache[cache_key] = embedding
+        _in_flight_results[cache_key] = embedding
         return embedding
 
     except APIConnectionError as e:
         logger.error(f"Embedding service connection error: {e}")
+        _in_flight_results[cache_key] = None
         return None
     except RateLimitError as e:
         logger.error(f"Embedding service rate limit reached: {e}")
@@ -89,7 +103,11 @@ async def generate_embedding(text: str, is_query: bool = False) -> Optional[List
         return None
     except Exception as e:
         logger.error(f"Unexpected error in embedding generation: {e.__class__.__name__}")
+        _in_flight_results[cache_key] = None
         return None
+    finally:
+        event.set()
+        _in_flight_locks.pop(cache_key, None)
 
 async def generate_embeddings_batch(texts: List[str]) -> List[Optional[List[float]]]:
     """Generate embeddings for a list of texts in batch."""

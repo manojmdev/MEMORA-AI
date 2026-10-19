@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import secrets
 from datetime import datetime, timezone, timedelta
@@ -111,7 +112,7 @@ async def validate_and_consume_approval(
             # Acquire exclusive row-level lock on task record for duration of transaction
             row = await conn.fetchrow(
                 """
-                SELECT id, session_id, status, approval_token, approval_token_hash, approval_status, approval_expires_at
+                SELECT id, session_id, status, approval_token, approval_token_hash, approval_status, approval_expires_at, plan_json
                 FROM agent_tasks
                 WHERE id = $1 AND session_id = $2
                 FOR UPDATE
@@ -123,11 +124,11 @@ async def validate_and_consume_approval(
             if not row:
                 return False, "Task not found or access denied for this session."
 
-            if row["status"] != TaskStatus.AWAITING_APPROVAL.value:
-                return False, f"Task is in status '{row['status']}', not awaiting approval."
-
             if row["approval_status"] != ApprovalStatus.PENDING.value:
                 return False, f"Approval has already been consumed (status: {row['approval_status']})."
+
+            if row["status"] != TaskStatus.AWAITING_APPROVAL.value:
+                return False, f"Task is in status '{row['status']}', not awaiting approval."
 
             now = datetime.now(timezone.utc)
             if row["approval_expires_at"] and row["approval_expires_at"] < now:
@@ -151,16 +152,40 @@ async def validate_and_consume_approval(
             if not secrets.compare_digest(row["approval_token_hash"], provided_hash):
                 return False, "Invalid approval token."
 
-            # Atomically mark consumed/approved
+            # Atomically update plan_json so awaiting_approval step transitions to pending
+            plan_json_data = json.loads(row["plan_json"]) if (row.get("plan_json") and isinstance(row["plan_json"], str)) else (row.get("plan_json") or {})
+            if isinstance(plan_json_data, dict) and "steps" in plan_json_data:
+                for s in plan_json_data["steps"]:
+                    if s.get("status") == "awaiting_approval":
+                        s["status"] = "pending"
+                        s["permission"] = "automatic"
+            updated_plan_json = json.dumps(plan_json_data)
+
+            # Atomically mark consumed/approved, set task status to RUNNING, and persist updated plan
             await conn.execute(
                 """
                 UPDATE agent_tasks
                 SET approval_status = $1,
+                    status = $2,
+                    plan_json = $3::jsonb,
                     approval_token = NULL,
                     updated_at = NOW()
-                WHERE id = $2
+                WHERE id = $4
                 """,
                 ApprovalStatus.APPROVED.value,
+                TaskStatus.RUNNING.value,
+                updated_plan_json,
+                task_id,
+            )
+
+            # Atomically advance checkpoint from awaiting_approval to ready
+            await conn.execute(
+                """
+                UPDATE agent_task_checkpoints
+                SET status = 'ready',
+                    updated_at = NOW()
+                WHERE task_id = $1 AND status = 'awaiting_approval'
+                """,
                 task_id,
             )
 
@@ -172,7 +197,7 @@ async def validate_and_consume_approval(
                     status, approval_status, result_summary, duration_ms
                 )
                 VALUES ($1, $2, 'approval_gate', 'approval_manager', '{"action": "approve"}'::jsonb,
-                        'succeeded', $3, 'Approval granted and consumed atomically.', 0)
+                        'succeeded', $3, 'Approval granted, consumed atomically, and execution resume intent recorded.', 0)
                 """,
                 task_id,
                 session_id.strip(),
