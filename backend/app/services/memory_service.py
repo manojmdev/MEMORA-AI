@@ -44,6 +44,10 @@ def record_from_row(row: asyncpg.Record) -> MemoryRecord:
         superseded_reason=row.get("superseded_reason"),
         source_message=row["source_message"],
         is_active=row["is_active"],
+        is_archived=bool(row.get("is_archived", False)),
+        archived_at=row.get("archived_at"),
+        access_count=int(row.get("access_count") or 0),
+        last_accessed_at=row.get("last_accessed_at"),
         has_embedding=has_emb,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -114,6 +118,17 @@ async def _add_memory_tx(
                         vector_sql,
                         existing["id"],
                     )
+                    try:
+                        await conn.execute(
+                            """
+                            INSERT INTO memory_lifecycle_events (session_id, memory_id, event_type, reason, actor)
+                            VALUES ($1, $2, 'confirmed', 'Memory reinforced and confirmed by subsequent statement.', 'system')
+                            """,
+                            session_id,
+                            existing["id"],
+                        )
+                    except Exception:
+                        pass
                     logger.info(f"Deduplicated existing memory key '{candidate.memory_key}' for session '{session_id}'.")
                     return record_from_row(updated_row)
 
@@ -138,6 +153,18 @@ async def _add_memory_tx(
                     superseded_reason,
                     existing["id"],
                 )
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO memory_lifecycle_events (session_id, memory_id, event_type, reason, actor)
+                        VALUES ($1, $2, 'superseded', $3, 'system')
+                        """,
+                        session_id,
+                        existing["id"],
+                        superseded_reason,
+                    )
+                except Exception:
+                    pass
 
             # Insert new active memory with embedding vector and intelligence metadata
             inserted_row = await conn.fetchrow(
@@ -174,6 +201,19 @@ async def _add_memory_tx(
                 candidate.source_message,
                 vector_sql,
             )
+
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO memory_lifecycle_events (session_id, memory_id, event_type, reason, actor)
+                    VALUES ($1, $2, 'created', 'Initial memory extraction and storage.', 'system')
+                    """,
+                    session_id,
+                    new_id,
+                )
+            except Exception:
+                pass
+
             return record_from_row(inserted_row)
 
 async def add_memory(session_id: str, candidate: MemoryCandidate, max_retries: int = 3) -> MemoryRecord:
@@ -412,3 +452,14 @@ async def delete_all_memories(session_id: str) -> int:
             count = 0
         logger.info(f"Deleted {count} memories for session '{session_id}'.")
         return count
+
+class MemoryService:
+    record_from_row = staticmethod(record_from_row)
+    add_memory = staticmethod(add_memory)
+    list_memories = staticmethod(list_memories)
+    get_memory = staticmethod(get_memory)
+    delete_memory = staticmethod(delete_memory)
+    delete_all_memories = staticmethod(delete_all_memories)
+    backfill_missing_embeddings = staticmethod(backfill_missing_embeddings)
+
+memory_service = MemoryService()

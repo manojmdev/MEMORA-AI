@@ -41,6 +41,12 @@ ALTER TABLE memories ADD COLUMN IF NOT EXISTS reason_for_storage TEXT;
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_reason TEXT;
 
+-- Sprint 2: Advanced Memory Intelligence 2.0 schema additions
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS access_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMPTZ;
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_session_active_memory_key 
 ON memories (session_id, memory_key) 
 WHERE is_active = TRUE;
@@ -54,6 +60,53 @@ CREATE INDEX IF NOT EXISTS idx_memories_status_valid ON memories (session_id, me
 CREATE INDEX IF NOT EXISTS idx_memories_embedding 
 ON memories USING hnsw (embedding vector_cosine_ops) 
 WHERE is_active = TRUE;
+
+-- Sprint 2: Typed Memory Relationship Graph
+CREATE TABLE IF NOT EXISTS memory_relationships (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id VARCHAR(255) NOT NULL,
+    source_memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    target_memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    relationship_type VARCHAR(100) NOT NULL,
+    strength DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    metadata_json JSONB DEFAULT '{{}}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_no_self_relationship CHECK (source_memory_id != target_memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mem_rel_session ON memory_relationships (session_id);
+CREATE INDEX IF NOT EXISTS idx_mem_rel_source ON memory_relationships (source_memory_id);
+CREATE INDEX IF NOT EXISTS idx_mem_rel_target ON memory_relationships (target_memory_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_mem_rel_pair ON memory_relationships (session_id, source_memory_id, target_memory_id, relationship_type);
+
+-- Sprint 2: Memory Consolidation History
+CREATE TABLE IF NOT EXISTS memory_consolidations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id VARCHAR(255) NOT NULL,
+    consolidated_memory_id UUID REFERENCES memories(id) ON DELETE SET NULL,
+    source_memory_ids UUID[] NOT NULL,
+    rationale TEXT NOT NULL,
+    cluster_topic VARCHAR(255),
+    status VARCHAR(50) NOT NULL DEFAULT 'applied',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_mem_cons_session ON memory_consolidations (session_id);
+
+-- Sprint 2: Memory Lifecycle Governance & Explainability Audit
+CREATE TABLE IF NOT EXISTS memory_lifecycle_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id VARCHAR(255) NOT NULL,
+    memory_id UUID NOT NULL,
+    event_type VARCHAR(50) NOT NULL,
+    reason TEXT,
+    actor VARCHAR(100) DEFAULT 'user',
+    metadata_json JSONB DEFAULT '{{}}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_mem_life_session ON memory_lifecycle_events (session_id);
+CREATE INDEX IF NOT EXISTS idx_mem_life_memory ON memory_lifecycle_events (memory_id);
 
 -- Day 6: Agentic Task Execution & Notes Storage
 CREATE TABLE IF NOT EXISTS notes (
@@ -110,6 +163,48 @@ WHERE approval_token_hash IS NULL AND approval_status = 'pending';
 UPDATE agent_tasks 
 SET approval_token = NULL 
 WHERE approval_token IS NOT NULL;
+
+-- Sprint 3: Agent Intelligence 2.0 Task Enhancements & Checkpoints
+ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS estimated_complexity VARCHAR(50);
+ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS estimated_cost_tier VARCHAR(50);
+ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS requires_clarification BOOLEAN DEFAULT FALSE;
+ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS clarification_prompt TEXT;
+
+CREATE TABLE IF NOT EXISTS agent_task_checkpoints (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+    session_id VARCHAR(255) NOT NULL,
+    step_id VARCHAR(100) NOT NULL,
+    tool_name VARCHAR(100),
+    arguments_json JSONB DEFAULT '{{}}',
+    dependencies TEXT[] DEFAULT '{{}}',
+    status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
+    error_classification VARCHAR(50),
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 2,
+    idempotency_key VARCHAR(128) NOT NULL,
+    result_json JSONB,
+    error_message TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_task_step_checkpoint UNIQUE (task_id, step_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoints_task_id ON agent_task_checkpoints (task_id);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session_id ON agent_task_checkpoints (session_id);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_status ON agent_task_checkpoints (status);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_idempotency ON agent_task_checkpoints (session_id, idempotency_key);
+
+-- Sprint 3.1: Execution Integrity, Worker Fencing & Downstream Reconciliation
+ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS lease_generation INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE agent_task_checkpoints ADD COLUMN IF NOT EXISTS external_operation_id VARCHAR(255);
+ALTER TABLE agent_task_checkpoints ADD COLUMN IF NOT EXISTS lease_generation INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE agent_task_checkpoints ADD COLUMN IF NOT EXISTS worker_id VARCHAR(100);
+ALTER TABLE agent_task_checkpoints ADD COLUMN IF NOT EXISTS execution_intent_persisted_at TIMESTAMPTZ;
+ALTER TABLE notes ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128);
+CREATE INDEX IF NOT EXISTS idx_notes_idempotency ON notes (session_id, idempotency_key);
 
 CREATE TABLE IF NOT EXISTS agent_execution_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
