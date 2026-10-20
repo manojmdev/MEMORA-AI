@@ -101,6 +101,8 @@ export function MemoryExplorerView({
       });
   }, [memories, searchQuery, selectedCategory, statusFilter, persistenceFilter, sourceFilter, sortBy]);
 
+  const currentTime = Date.now();
+
   const handleOpenEdit = (m) => {
     setEditingMemory(m);
     setEditContent(m.content || "");
@@ -130,7 +132,7 @@ export function MemoryExplorerView({
     try {
       const data = await onExplainMemory(m.id);
       setExplainData(data);
-    } catch (_e) {
+    } catch {
       showToast("Failed to fetch memory explainability report", "error");
     } finally {
       setLoadingExplain(false);
@@ -309,7 +311,7 @@ export function MemoryExplorerView({
         >
           {filteredMemories.map((m) => {
             const isExplicit = m.information_source === "explicit_statement";
-            const isExpired = m.valid_until && new Date(m.valid_until).getTime() < Date.now();
+            const isExpired = m.valid_until && new Date(m.valid_until).getTime() < currentTime;
 
             return (
               <div

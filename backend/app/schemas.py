@@ -222,6 +222,14 @@ class ChatResponse(BaseModel):
     session_id: str
     memories_recalled: List[Dict[str, Any]] = Field(default_factory=list)
     memories_extracted: List[Dict[str, Any]] = Field(default_factory=list)
+    memory_persistence_status: str = Field(
+        default="success",
+        description="Status of memory persistence: 'success', 'failed', or 'partial'"
+    )
+    memory_persistence_error: Optional[str] = Field(
+        default=None,
+        description="Detailed error message if memory extraction or persistence failed"
+    )
 
 # ============================================================================
 # SPRINT 2: ADVANCED MEMORY INTELLIGENCE 2.0 SCHEMAS

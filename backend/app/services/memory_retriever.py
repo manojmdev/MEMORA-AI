@@ -66,32 +66,33 @@ class KeywordMemoryRetriever(BaseMemoryRetriever):
         session_id = session_id.strip()
         keywords = extract_keywords(query)
 
-        async with pool.acquire() as conn:
-            # Query all active, non-expired memories for the isolated session
-            if category:
-                rows = await conn.fetch(
-                    """
-                    SELECT * FROM memories 
-                    WHERE session_id = $1 AND is_active = TRUE 
-                      AND (valid_until IS NULL OR valid_until > NOW())
-                      AND category = $2
-                    ORDER BY updated_at DESC
-                    LIMIT 50
-                    """,
-                    session_id,
-                    category.strip().lower(),
-                )
-            else:
-                rows = await conn.fetch(
-                    """
-                    SELECT * FROM memories 
-                    WHERE session_id = $1 AND is_active = TRUE
-                      AND (valid_until IS NULL OR valid_until > NOW())
-                    ORDER BY updated_at DESC
-                    LIMIT 50
-                    """,
-                    session_id,
-                )
+        try:
+            async with pool.acquire() as conn:
+                # Query all active, non-expired memories for the isolated session
+                if category:
+                    rows = await conn.fetch(
+                        """
+                        SELECT * FROM memories 
+                        WHERE session_id = $1 AND is_active = TRUE 
+                          AND (valid_until IS NULL OR valid_until > NOW())
+                          AND category = $2
+                        ORDER BY updated_at DESC
+                        LIMIT 50
+                        """,
+                        session_id,
+                        category.strip().lower(),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        """
+                        SELECT * FROM memories 
+                        WHERE session_id = $1 AND is_active = TRUE
+                          AND (valid_until IS NULL OR valid_until > NOW())
+                        ORDER BY updated_at DESC
+                        LIMIT 50
+                        """,
+                        session_id,
+                    )
 
             records = [record_from_row(r) for r in rows]
             if not records:
@@ -134,6 +135,9 @@ class KeywordMemoryRetriever(BaseMemoryRetriever):
 
             logger.info(f"Retrieved {len(results)} relevant memories for session '{session_id}' against query: '{query[:40]}...'")
             return results
+        except Exception as e:
+            logger.warning(f"Error during keyword memory retrieval: {e}")
+            return []
 
 # Default retriever instance
 default_retriever = KeywordMemoryRetriever()

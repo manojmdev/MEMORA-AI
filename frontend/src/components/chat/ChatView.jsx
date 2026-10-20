@@ -377,6 +377,64 @@ export function ChatView({
                   )}
                 </div>
               )}
+
+              {/* Extracted Memories Indicator */}
+              {!isUser && msg.memories_extracted && msg.memories_extracted.length > 0 && (
+                <div
+                  style={{
+                    marginLeft: "44px",
+                    maxWidth: "90%",
+                    borderRadius: "10px",
+                    background: "rgba(16, 185, 129, 0.08)",
+                    border: "1px solid rgba(16, 185, 129, 0.25)",
+                    padding: "8px 12px",
+                    fontSize: "0.8rem",
+                    color: "#6ee7b7",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "6px",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", fontWeight: 500 }}>
+                    <Sparkles size={14} color="#10b981" />
+                    <span>
+                      {msg.memories_extracted.length} New Memor{msg.memories_extracted.length > 1 ? "ies" : "y"} Learned & Saved
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "2px" }}>
+                    {msg.memories_extracted.map((cand, cIdx) => (
+                      <span
+                        key={cIdx}
+                        className="badge badge-emerald"
+                        style={{ fontSize: "0.72rem", padding: "2px 8px" }}
+                      >
+                        #{cand.memory_key}: {cand.content}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Memory Persistence Notice (if failed) */}
+              {!isUser && msg.memory_persistence_status === "failed" && (
+                <div
+                  style={{
+                    marginLeft: "44px",
+                    maxWidth: "90%",
+                    borderRadius: "10px",
+                    background: "rgba(245, 158, 11, 0.08)",
+                    border: "1px solid rgba(245, 158, 11, 0.25)",
+                    padding: "8px 12px",
+                    fontSize: "0.78rem",
+                    color: "#fcd34d",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                  }}
+                >
+                  <span>⚠️ Memory persistence notice: {msg.memory_persistence_error || "Could not save to database."}</span>
+                </div>
+              )}
             </div>
           );
         })}

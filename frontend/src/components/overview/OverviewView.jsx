@@ -25,8 +25,8 @@ export function OverviewView({
   onNavigate,
 }) {
   const pendingTasks = (tasks || []).filter((t) => t.status === "awaiting_approval");
-  const completedTasks = (tasks || []).filter((t) => t.status === "completed");
-  const failedTasks = (tasks || []).filter((t) => t.status === "failed");
+  const completedTasks = (tasks || []).filter((t) => t.status === "completed" || t.status === "succeeded");
+  const failedTasks = (tasks || []).filter((t) => t.status === "failed" || t.status === "needs_reconciliation");
 
   return (
     <div className="view-container overview-view" style={{ padding: "24px", maxWidth: "1380px", margin: "0 auto" }}>
@@ -345,11 +345,11 @@ export function OverviewView({
                 }}
               >
                 <div style={{ display: "flex", alignItems: "center", gap: "12px", minWidth: 0 }}>
-                  {task.status === "completed" ? (
+                  {task.status === "completed" || task.status === "succeeded" ? (
                     <CheckCircle2 size={16} color="var(--color-success)" style={{ flexShrink: 0 }} />
                   ) : task.status === "awaiting_approval" ? (
                     <AlertTriangle size={16} color="var(--color-warning)" style={{ flexShrink: 0 }} />
-                  ) : task.status === "failed" ? (
+                  ) : task.status === "failed" || task.status === "needs_reconciliation" ? (
                     <XCircle size={16} color="var(--color-danger)" style={{ flexShrink: 0 }} />
                   ) : (
                     <Activity size={16} color="var(--accent-primary)" style={{ flexShrink: 0 }} />
@@ -365,11 +365,11 @@ export function OverviewView({
                 </div>
                 <span
                   className={`badge ${
-                    task.status === "completed"
+                    task.status === "completed" || task.status === "succeeded"
                       ? "badge-emerald"
                       : task.status === "awaiting_approval"
                       ? "badge-amber"
-                      : task.status === "failed"
+                      : task.status === "failed" || task.status === "needs_reconciliation"
                       ? "badge-rose"
                       : "badge-indigo"
                   }`}

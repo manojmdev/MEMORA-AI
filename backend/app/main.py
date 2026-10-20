@@ -1,8 +1,11 @@
 import asyncio
 import logging
+from contextvars import ContextVar
 from contextlib import asynccontextmanager
 from typing import Optional, List, Set
 from uuid import UUID, uuid4
+import httpx
+from openai import APITimeoutError, APIConnectionError, RateLimitError, APIError
 from fastapi import FastAPI, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
@@ -61,7 +64,24 @@ from app.services import note_service
 from app.database import init_db_pool, close_db_pool, check_db_health, recover_interrupted_tasks
 from app.auth.session_guard import validate_session_id, get_current_principal, UserPrincipal
 
-logging.basicConfig(level=logging.INFO)
+correlation_id_var: ContextVar[str] = ContextVar("correlation_id", default="system")
+
+def get_current_correlation_id() -> str:
+    return correlation_id_var.get()
+
+class CorrelationIdFilter(logging.Filter):
+    def filter(self, record):
+        record.correlation_id = correlation_id_var.get()
+        return True
+
+corr_filter = CorrelationIdFilter()
+log_handler = logging.StreamHandler()
+log_handler.addFilter(corr_filter)
+log_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(correlation_id)s] [%(levelname)s] [%(name)s]: %(message)s"))
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.handlers = [log_handler]
+
 logger = logging.getLogger(__name__)
 
 # Managed background task pool for safe lifecycle shutdown
@@ -69,8 +89,24 @@ _managed_tasks: Set[asyncio.Task] = set()
 
 def safe_internal_error(e: Exception, context_msg: str, request: Optional[Request] = None) -> HTTPException:
     """Log full stack trace server-side with correlation ID, and return sanitized error to client."""
-    corr_id = getattr(request.state, "correlation_id", "internal") if request and hasattr(request, "state") else "internal"
+    corr_id = getattr(request.state, "correlation_id", "internal") if request and hasattr(request, "state") else get_current_correlation_id()
     logger.error(f"[{corr_id}] {context_msg}: {e}", exc_info=True)
+
+    if isinstance(e, (APITimeoutError, asyncio.TimeoutError, httpx.TimeoutException)):
+        return HTTPException(
+            status_code=504,
+            detail=f"The AI service provider timed out while processing your request. Please try again. (Reference ID: {corr_id})"
+        )
+    if isinstance(e, (APIConnectionError, httpx.ConnectError)):
+        return HTTPException(
+            status_code=503,
+            detail=f"AI service provider is temporarily unreachable. Please retry. (Reference ID: {corr_id})"
+        )
+    if isinstance(e, RateLimitError):
+        return HTTPException(
+            status_code=429,
+            detail=f"AI service rate limit exceeded. Please try again later. (Reference ID: {corr_id})"
+        )
     return HTTPException(
         status_code=500,
         detail=f"An internal error occurred while processing your request. (Reference ID: {corr_id})"
@@ -114,9 +150,13 @@ async def correlation_id_middleware(request: Request, call_next):
     """Attach or generate X-Request-ID correlation ID for full request-lifecycle traceability."""
     corr_id = request.headers.get("X-Request-ID") or uuid4().hex
     request.state.correlation_id = corr_id
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = corr_id
-    return response
+    token = correlation_id_var.set(corr_id)
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = corr_id
+        return response
+    finally:
+        correlation_id_var.reset(token)
 
 cors_origins = [
     settings.FRONTEND_ORIGIN,
@@ -189,7 +229,7 @@ async def chat(
 ):
     valid_sid = validate_session_id(request.session_id, principal)
     try:
-        reply, recalled, extracted = await generate_personalized_response(
+        reply, recalled, extracted, p_status, p_error = await generate_personalized_response(
             message=request.message,
             session_id=valid_sid
         )
@@ -198,7 +238,9 @@ async def chat(
             model=settings.NEBIUS_MODEL,
             session_id=valid_sid,
             memories_recalled=[m.model_dump(mode="json") for m in recalled],
-            memories_extracted=[c.model_dump(mode="json") for c in extracted]
+            memories_extracted=[c.model_dump(mode="json") for c in extracted],
+            memory_persistence_status=p_status,
+            memory_persistence_error=p_error
         )
     except HTTPException:
         raise

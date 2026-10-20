@@ -47,9 +47,12 @@ class CheckpointManager:
             async with conn.transaction():
                 for step in plan.steps:
                     cp_id = uuid4()
-                    initial_status = StepStatus.PENDING.value
-                    if not step.dependencies:
+                    if step.status and step.status != StepStatus.PENDING:
+                        initial_status = step.status.value
+                    elif not step.dependencies:
                         initial_status = StepStatus.READY.value
+                    else:
+                        initial_status = StepStatus.PENDING.value
 
                     args_json = json.dumps(step.arguments or {}, default=str)
                     deps = list(step.dependencies or [])

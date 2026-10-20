@@ -322,7 +322,7 @@ export function AgentWorkspaceView({
                 <h3 className="card-title">Execution Plan & DAG Steps</h3>
                 <span
                   className={`badge ${
-                    status === "completed"
+                    status === "completed" || status === "succeeded"
                       ? "badge-emerald"
                       : status === "awaiting_approval"
                       ? "badge-amber"
@@ -344,7 +344,7 @@ export function AgentWorkspaceView({
                 <Clock size={14} /> View Checkpoints
               </button>
 
-              {status === "failed" && (
+              {(status === "failed" || status === "needs_reconciliation") && (
                 <button className="btn btn-primary btn-sm" onClick={handleRetry} disabled={actionLoading}>
                   <RotateCcw size={14} /> Retry Task
                 </button>
@@ -356,20 +356,28 @@ export function AgentWorkspaceView({
           <div style={{ display: "flex", flexDirection: "column", gap: "12px", marginTop: "14px" }}>
             {steps.map((step, idx) => {
               const isCurrent = idx === activeTask.current_step_index;
-              const isDone = step.status === "completed";
+              const isDone = step.status === "completed" || step.status === "succeeded";
               const isFailed = step.status === "failed";
-              const isWaiting = step.status === "waiting_approval";
+              const isWaiting = step.status === "waiting_approval" || step.status === "awaiting_approval";
+              const isSkipped = step.status === "skipped";
+              const isCancelled = step.status === "cancelled";
+              const isRetrying = step.status === "retrying";
 
               return (
                 <div
                   key={step.step_id || idx}
+                  className={`dag-step-item ${isCurrent ? "dag-step-current" : ""} ${isWaiting ? "dag-step-awaiting" : ""}`}
                   style={{
                     background: isCurrent ? "rgba(99, 102, 241, 0.08)" : "var(--bg-surface-elevated)",
                     border: `1px solid ${
                       isCurrent
                         ? "var(--accent-primary)"
                         : isDone
-                        ? "rgba(16, 185, 129, 0.3)"
+                        ? "rgba(16, 185, 129, 0.35)"
+                        : isFailed
+                        ? "rgba(239, 68, 68, 0.4)"
+                        : isWaiting
+                        ? "rgba(245, 158, 11, 0.4)"
                         : "var(--border-subtle)"
                     }`,
                     borderRadius: "10px",
@@ -378,6 +386,7 @@ export function AgentWorkspaceView({
                     alignItems: "flex-start",
                     justifyContent: "space-between",
                     gap: "12px",
+                    transition: "border-color 0.2s ease, box-shadow 0.2s ease",
                   }}
                 >
                   <div style={{ display: "flex", gap: "12px", alignItems: "flex-start" }}>
@@ -389,6 +398,10 @@ export function AgentWorkspaceView({
                         <XCircle size={18} color="var(--color-danger)" />
                       ) : isWaiting ? (
                         <AlertTriangle size={18} color="var(--color-warning)" />
+                      ) : isSkipped || isCancelled ? (
+                        <StopCircle size={18} color="var(--text-muted)" />
+                      ) : isRetrying ? (
+                        <RotateCcw size={18} color="var(--accent-primary)" className="spinning" />
                       ) : isCurrent ? (
                         <Sparkles size={18} color="var(--accent-primary)" className="spinning" />
                       ) : (
@@ -419,7 +432,7 @@ export function AgentWorkspaceView({
                       </div>
 
                       {/* Tool Parameters */}
-                      {step.tool_input && (
+                      {(step.tool_input || step.arguments) && (
                         <div
                           style={{
                             fontFamily: "var(--font-family-mono)",
@@ -432,7 +445,27 @@ export function AgentWorkspaceView({
                             overflowX: "auto",
                           }}
                         >
-                          Input: {JSON.stringify(step.tool_input)}
+                          Input: {JSON.stringify(step.tool_input || step.arguments)}
+                        </div>
+                      )}
+
+                      {/* Error Banner on Step */}
+                      {step.error && (
+                        <div
+                          style={{
+                            marginTop: "6px",
+                            fontSize: "0.78rem",
+                            color: "var(--color-danger)",
+                            background: "rgba(239, 68, 68, 0.08)",
+                            padding: "4px 8px",
+                            borderRadius: "4px",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "6px",
+                          }}
+                        >
+                          <AlertTriangle size={13} />
+                          <span>{step.error}</span>
                         </div>
                       )}
 
@@ -462,7 +495,9 @@ export function AgentWorkspaceView({
                         ? "badge-rose"
                         : isWaiting
                         ? "badge-amber"
-                        : isCurrent
+                        : isSkipped || isCancelled
+                        ? "badge-neutral"
+                        : isCurrent || isRetrying
                         ? "badge-indigo"
                         : "badge-neutral"
                     }`}
@@ -473,6 +508,35 @@ export function AgentWorkspaceView({
               );
             })}
           </div>
+
+          {/* Failure Diagnostics Banner */}
+          {(status === "failed" || status === "needs_reconciliation") && (
+            <div
+              style={{
+                marginTop: "18px",
+                background: "rgba(239, 68, 68, 0.08)",
+                border: "1px solid var(--color-danger-border, rgba(239, 68, 68, 0.3))",
+                borderRadius: "10px",
+                padding: "16px",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", color: "var(--color-danger)", fontWeight: 600, fontSize: "0.88rem", marginBottom: "8px" }}>
+                <AlertTriangle size={18} />
+                <span>Task Execution Diagnostics & Failure Root Cause</span>
+              </div>
+              <div style={{ fontSize: "0.85rem", color: "var(--text-primary)", marginBottom: "8px", lineHeight: 1.5 }}>
+                {activeTask.failure_details?.safe_error_message || activeTask.result_summary || activeTask.error_message || "The task halted due to an unrecoverable failure or expired approval."}
+              </div>
+              {activeTask.failure_details && (
+                <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", fontSize: "0.75rem", color: "var(--text-secondary)", marginTop: "8px", paddingTop: "8px", borderTop: "1px solid rgba(239, 68, 68, 0.15)" }}>
+                  <span><strong>Error Category:</strong> <code>{activeTask.failure_details.error_category}</code></span>
+                  {activeTask.failure_details.failed_step_id && <span><strong>Failed Step:</strong> <code>{activeTask.failure_details.failed_step_id}</code></span>}
+                  {activeTask.failure_details.tool_name && <span><strong>Tool:</strong> <code>{activeTask.failure_details.tool_name}</code></span>}
+                  <span><strong>Retryable:</strong> {activeTask.failure_details.is_retryable ? "Yes (idempotent)" : "No (requires manual intervention)"}</span>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Final Assistant Response Synthesis */}
           {activeTask.response && (

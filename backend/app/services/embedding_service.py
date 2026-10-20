@@ -1,7 +1,8 @@
 import asyncio
 import logging
 from typing import List, Optional
-from openai import AsyncOpenAI, APIError, APIConnectionError, RateLimitError
+import httpx
+from openai import AsyncOpenAI, APIError, APIConnectionError, RateLimitError, APITimeoutError
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -98,8 +99,9 @@ async def generate_embedding(text: str, is_query: bool = False) -> Optional[List
     except APIError as e:
         logger.error(f"Embedding service API error: {e.message if hasattr(e, 'message') else e}")
         return None
-    except asyncio.TimeoutError:
-        logger.error("Embedding generation timed out after 30 seconds.")
+    except (APITimeoutError, asyncio.TimeoutError, httpx.TimeoutException) as e:
+        logger.warning(f"Embedding service timed out: {e}")
+        _in_flight_results[cache_key] = None
         return None
     except Exception as e:
         logger.error(f"Unexpected error in embedding generation: {e.__class__.__name__}")

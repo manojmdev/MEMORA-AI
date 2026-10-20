@@ -9,16 +9,51 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 class TaskStatus(str, Enum):
+    CREATED = "created"
+    PLANNING = "planning"
     PROPOSED = "proposed"
+    AWAITING_CLARIFICATION = "awaiting_clarification"
     AWAITING_APPROVAL = "awaiting_approval"
     RUNNING = "running"
+    RETRYING = "retrying"
     CANCEL_REQUESTED = "cancel_requested"
+    NEEDS_RECONCILIATION = "needs_reconciliation"
     SUCCEEDED = "succeeded"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
-    NEEDS_RECONCILIATION = "needs_reconciliation"
-    AWAITING_CLARIFICATION = "awaiting_clarification"
+
+# Strict State Machine Transition Rules
+VALID_TASK_TRANSITIONS = {
+    TaskStatus.CREATED: {TaskStatus.PLANNING, TaskStatus.RUNNING, TaskStatus.AWAITING_CLARIFICATION, TaskStatus.FAILED, TaskStatus.CANCELLED},
+    TaskStatus.PROPOSED: {TaskStatus.PLANNING, TaskStatus.RUNNING, TaskStatus.AWAITING_APPROVAL, TaskStatus.AWAITING_CLARIFICATION, TaskStatus.FAILED, TaskStatus.CANCELLED},
+    TaskStatus.PLANNING: {TaskStatus.RUNNING, TaskStatus.AWAITING_APPROVAL, TaskStatus.AWAITING_CLARIFICATION, TaskStatus.FAILED, TaskStatus.CANCELLED},
+    TaskStatus.AWAITING_CLARIFICATION: {TaskStatus.PLANNING, TaskStatus.RUNNING, TaskStatus.FAILED, TaskStatus.CANCELLED},
+    TaskStatus.AWAITING_APPROVAL: {TaskStatus.RUNNING, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.AWAITING_APPROVAL},
+    TaskStatus.RUNNING: {TaskStatus.SUCCEEDED, TaskStatus.COMPLETED, TaskStatus.AWAITING_APPROVAL, TaskStatus.FAILED, TaskStatus.NEEDS_RECONCILIATION, TaskStatus.CANCEL_REQUESTED, TaskStatus.CANCELLED, TaskStatus.RETRYING},
+    TaskStatus.RETRYING: {TaskStatus.RUNNING, TaskStatus.SUCCEEDED, TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.NEEDS_RECONCILIATION, TaskStatus.CANCELLED},
+    TaskStatus.CANCEL_REQUESTED: {TaskStatus.CANCELLED, TaskStatus.SUCCEEDED, TaskStatus.COMPLETED, TaskStatus.NEEDS_RECONCILIATION, TaskStatus.FAILED},
+    TaskStatus.NEEDS_RECONCILIATION: {TaskStatus.RETRYING, TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.FAILED, TaskStatus.SUCCEEDED, TaskStatus.COMPLETED},
+    TaskStatus.FAILED: {TaskStatus.RETRYING, TaskStatus.RUNNING},  # Allowed strictly on authorized retry
+    TaskStatus.SUCCEEDED: set(),  # Terminal
+    TaskStatus.COMPLETED: set(),  # Terminal
+    TaskStatus.CANCELLED: set(),  # Terminal
+}
+
+class InvalidStateTransitionError(ValueError):
+    """Raised when an illegal task state machine transition is attempted."""
+    pass
+
+def validate_task_transition(current_status: TaskStatus, next_status: TaskStatus) -> bool:
+    """Validate whether transitioning from current_status to next_status is permitted."""
+    if current_status == next_status:
+        return True
+    allowed = VALID_TASK_TRANSITIONS.get(current_status, set())
+    if next_status not in allowed:
+        raise InvalidStateTransitionError(
+            f"Cannot transition task from '{current_status.value}' to '{next_status.value}'. Permitted: {[s.value for s in allowed]}"
+        )
+    return True
 
 class StepStatus(str, Enum):
     PENDING = "pending"
@@ -92,7 +127,8 @@ class AgentPlanStep(BaseModel):
 
 class AgentPlan(BaseModel):
     title: str = Field(default="Agent Execution Plan", description="Short plan title")
-    objective: str = Field(..., description="Clear task goal")
+    objective: str = Field(default="Execute task", description="Clear task goal")
+    goal: Optional[str] = None
     steps: List[AgentPlanStep] = Field(default_factory=list)
     requires_approval: bool = False
     estimated_tools: List[str] = Field(default_factory=list)
@@ -166,6 +202,16 @@ class StaleWorkerError(Exception):
     """Raised when worker lease expires or lease generation token is superseded."""
     pass
 
+class TaskFailureDetails(BaseModel):
+    error_category: Optional[str] = None
+    failed_step_id: Optional[str] = None
+    tool_name: Optional[str] = None
+    failure_timestamp: Optional[datetime] = None
+    is_retryable: bool = False
+    attempt_count: int = 1
+    safe_error_message: Optional[str] = None
+    correlation_id: Optional[str] = None
+
 class AgentTask(BaseModel):
     id: UUID
     session_id: str
@@ -174,6 +220,8 @@ class AgentTask(BaseModel):
     plan: Optional[AgentPlan] = None
     status: TaskStatus = TaskStatus.PROPOSED
     result_summary: Optional[str] = None
+    error_message: Optional[str] = None
+    failure_details: Optional[TaskFailureDetails] = None
     approval_token: Optional[str] = None
     approval_status: Optional[str] = None
     approval_expires_at: Optional[datetime] = None

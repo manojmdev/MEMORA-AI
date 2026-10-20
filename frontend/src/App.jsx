@@ -173,7 +173,7 @@ function AppContent() {
         fetchTasks(),
       ]);
       showToast("Workspace data synchronized", "success", 2000);
-    } catch (_e) {
+    } catch {
       showToast("Data refresh encountered issues", "error");
     } finally {
       setRefreshing(false);
@@ -193,10 +193,26 @@ function AppContent() {
         content: res.reply,
         memories_recalled: res.memories_recalled || [],
         memories_extracted: res.memories_extracted || [],
+        memory_persistence_status: res.memory_persistence_status || "success",
+        memory_persistence_error: res.memory_persistence_error || null,
       };
       setMessages((prev) => [...prev, assistantMsg]);
 
-      // Silently refresh memories and dashboard stats to reflect newly extracted items
+      if (res.memory_persistence_status === "failed") {
+        showToast(
+          `Memory persistence notice: ${res.memory_persistence_error || "Could not save memories."}`,
+          "warning",
+          5000
+        );
+      } else if (res.memory_persistence_status === "partial") {
+        showToast(
+          "Memory persistence notice: Some memories could not be saved.",
+          "warning",
+          4000
+        );
+      }
+
+      // Refresh memories and dashboard stats to reflect newly extracted items
       fetchMemories();
       fetchDashboardStats();
       fetchGraphData();
@@ -321,7 +337,7 @@ function AppContent() {
     try {
       const res = await api.getTaskCheckpoints(sessionId, taskId);
       setTaskCheckpoints(res?.checkpoints || []);
-    } catch (_e) {
+    } catch {
       showToast("Unable to load checkpoints", "error");
     }
   };

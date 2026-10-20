@@ -1,8 +1,10 @@
+import asyncio
 import json
 import logging
 import re
-from typing import List
-from openai import AsyncOpenAI, APIError
+from typing import List, Tuple, Optional
+import httpx
+from openai import AsyncOpenAI, APIError, APITimeoutError, APIConnectionError
 from app.config import settings
 from app.schemas import MemoryCandidate, ExtractionResult
 
@@ -86,22 +88,29 @@ Respond with ONLY a raw JSON object (no markdown, no conversational commentary):
 """
 
 def clean_json_string(raw: str) -> str:
-    """Clean markdown code fences from JSON output if present."""
-    raw = raw.strip()
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
+    """Clean markdown code fences from JSON output if present, or extract outer JSON object."""
+    if not raw or not isinstance(raw, str):
+        return ""
+    cleaned = raw.strip()
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
     if match:
-        return match.group(1).strip()
-    return raw
+        cleaned = match.group(1).strip()
+    if not (cleaned.startswith("{") and cleaned.endswith("}")):
+        start_idx = cleaned.find("{")
+        end_idx = cleaned.rfind("}")
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            cleaned = cleaned[start_idx:end_idx + 1].strip()
+    return cleaned
 
-async def extract_memories(user_message: str) -> List[MemoryCandidate]:
+async def extract_memories_with_status(user_message: str) -> Tuple[List[MemoryCandidate], Optional[str]]:
     """
     Extract structured memory candidates from a user message using NVIDIA Nemotron.
-    Validates model output using Pydantic to ensure strict schema adherence.
-    Filters out low-value candidates with importance_score < 0.40.
+    Returns (candidates, error_message).
+    If extraction fails due to provider error, timeout, malformed JSON, or schema error,
+    returns ([], error_message). If successful or clean empty, returns (candidates, None).
     """
-    # Guard against trivial or empty input
     if not user_message or len(user_message.strip()) < 3:
-        return []
+        return [], None
 
     try:
         response = await client.chat.completions.create(
@@ -112,37 +121,51 @@ async def extract_memories(user_message: str) -> List[MemoryCandidate]:
             ],
             temperature=0.1,  # Low temperature for deterministic structured extraction
         )
+    except (APITimeoutError, asyncio.TimeoutError, httpx.TimeoutException) as timeout_err:
+        logger.warning(f"Nebius API timeout during memory extraction: {timeout_err}")
+        return [], "Extraction model provider timed out."
+    except (APIConnectionError, httpx.ConnectError) as conn_err:
+        logger.warning(f"Nebius API connection error during memory extraction: {conn_err}")
+        return [], "Extraction model provider connection error."
+    except APIError as api_err:
+        logger.warning(f"Nebius API error during memory extraction: {api_err}")
+        return [], f"Extraction model API error: {getattr(api_err, 'message', str(api_err))}"
+    except Exception as e:
+        logger.warning(f"Unexpected error in memory extraction call: {e}")
+        return [], f"Extraction model unexpected error: {str(e)}"
 
-        content = response.choices[0].message.content or ""
-        cleaned = clean_json_string(content)
+    content = response.choices[0].message.content or "" if response and response.choices and response.choices[0].message else ""
+    cleaned = clean_json_string(content)
 
-        if not cleaned:
-            return []
+    if not cleaned:
+        return [], "Extraction model returned empty output."
 
-        # Parse JSON
+    try:
         parsed_data = json.loads(cleaned)
-        
-        # Validate through Pydantic
-        result = ExtractionResult.model_validate(parsed_data)
-        
-        # Day 5 Filter: Filter out low-importance trivial noise (< 0.40)
-        filtered_candidates = [
-            cand for cand in result.candidates
-            if cand.importance_score >= 0.40
-        ]
-        
-        logger.info(
-            f"Extracted {len(result.candidates)} candidates, "
-            f"retained {len(filtered_candidates)} high-value candidates (importance >= 0.40)."
-        )
-        return filtered_candidates
-
     except json.JSONDecodeError as e:
         logger.warning(f"Failed to decode JSON from memory extraction model: {e}")
-        return []
-    except APIError as e:
-        logger.error(f"Nebius API error during memory extraction: {e}")
-        return []
+        return [], f"Malformed JSON output from extraction model: {e}"
+
+    try:
+        result = ExtractionResult.model_validate(parsed_data)
     except Exception as e:
-        logger.error(f"Unexpected error in memory extraction: {e}")
-        return []
+        logger.warning(f"Pydantic validation failed on extraction output: {e}")
+        return [], f"Pydantic validation failed on extraction: {e}"
+
+    filtered_candidates = [
+        cand for cand in result.candidates
+        if cand.importance_score >= 0.40
+    ]
+    logger.info(
+        f"Extracted {len(result.candidates)} candidates, "
+        f"retained {len(filtered_candidates)} high-value candidates (importance >= 0.40)."
+    )
+    return filtered_candidates, None
+
+async def extract_memories(user_message: str) -> List[MemoryCandidate]:
+    """
+    Extract structured memory candidates from a user message using NVIDIA Nemotron.
+    Backward-compatible wrapper returning only candidates.
+    """
+    candidates, _ = await extract_memories_with_status(user_message)
+    return candidates

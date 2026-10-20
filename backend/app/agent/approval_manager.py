@@ -36,11 +36,13 @@ def create_approval_request(
     task_id: UUID,
     step_id: str,
     tool_name: str,
-    arguments: Dict[str, Any]
+    arguments: Dict[str, Any],
+    ttl_seconds: Optional[int] = None
 ) -> ApprovalRequest:
     """Generate a cryptographically unpredictable approval request bound to task and step."""
     token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=APPROVAL_VALIDITY_MINUTES)
+    validity_delta = timedelta(seconds=ttl_seconds) if ttl_seconds is not None else timedelta(minutes=APPROVAL_VALIDITY_MINUTES)
+    expires_at = datetime.now(timezone.utc) + validity_delta
 
     title = arguments.get("title") or "Persistent Note"
     content = arguments.get("content") or ""
@@ -132,15 +134,41 @@ async def validate_and_consume_approval(
 
             now = datetime.now(timezone.utc)
             if row["approval_expires_at"] and row["approval_expires_at"] < now:
+                # Update plan_json steps so the awaiting_approval step transitions to 'failed' with expiration error
+                plan_json_data = json.loads(row["plan_json"]) if (row.get("plan_json") and isinstance(row["plan_json"], str)) else (row.get("plan_json") or {})
+                if isinstance(plan_json_data, dict) and "steps" in plan_json_data:
+                    for s in plan_json_data["steps"]:
+                        if s.get("status") == "awaiting_approval":
+                            s["status"] = "failed"
+                            s["error"] = "Approval request expired before authorization was received."
+                updated_plan_json = json.dumps(plan_json_data)
+
                 await conn.execute(
                     """
                     UPDATE agent_tasks 
                     SET approval_status = $1, 
-                        updated_at = NOW() 
-                    WHERE id = $2
+                        status = $2,
+                        result_summary = 'Approval request expired before authorization was received.',
+                        plan_json = $3::jsonb,
+                        updated_at = NOW(),
+                        completed_at = NOW()
+                    WHERE id = $4
                     """,
                     ApprovalStatus.EXPIRED.value,
+                    TaskStatus.FAILED.value,
+                    updated_plan_json,
                     task_id,
+                )
+                await conn.execute(
+                    """
+                    UPDATE agent_task_checkpoints
+                    SET status = 'failed',
+                        error_message = 'Approval request expired before authorization was received.',
+                        completed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE task_id = $1 AND status IN ('awaiting_approval', 'pending', 'ready')
+                    """,
+                    task_id
                 )
                 return False, "Approval token has expired."
 
@@ -206,7 +234,7 @@ async def validate_and_consume_approval(
 
             return True, None
 
-async def reject_approval(task_id: UUID, session_id: str) -> Tuple[bool, Optional[str]]:
+async def reject_approval(task_id: UUID, session_id: str, reason: Optional[str] = None) -> Tuple[bool, Optional[str]]:
     """
     Explicitly reject pending approval atomically and transition task to CANCELLED.
     Enforces state machine rules:
@@ -216,6 +244,10 @@ async def reject_approval(task_id: UUID, session_id: str) -> Tuple[bool, Optiona
     - Approval must not be expired
     - Transactional audit log insertion (failures roll back rejection)
     """
+    if isinstance(task_id, str):
+        task_id = UUID(task_id)
+
+    rejection_msg = reason or "User rejected the requested operation."
     pool = await get_db_pool()
     if pool is None:
         return False, "Database pool is unavailable."
@@ -224,7 +256,7 @@ async def reject_approval(task_id: UUID, session_id: str) -> Tuple[bool, Optiona
         async with conn.transaction():
             row = await conn.fetchrow(
                 """
-                SELECT id, session_id, status, approval_status, approval_expires_at
+                SELECT id, session_id, status, approval_status, approval_expires_at, plan_json
                 FROM agent_tasks
                 WHERE id = $1 AND session_id = $2
                 FOR UPDATE
@@ -245,20 +277,51 @@ async def reject_approval(task_id: UUID, session_id: str) -> Tuple[bool, Optiona
             # Expiration check
             now = datetime.now(timezone.utc)
             if row["approval_expires_at"] and row["approval_expires_at"] < now:
+                plan_json_data = json.loads(row["plan_json"]) if (row.get("plan_json") and isinstance(row["plan_json"], str)) else (row.get("plan_json") or {})
+                if isinstance(plan_json_data, dict) and "steps" in plan_json_data:
+                    for s in plan_json_data["steps"]:
+                        if s.get("status") == "awaiting_approval":
+                            s["status"] = "failed"
+                            s["error"] = "Approval request expired before rejection."
+                updated_plan_json = json.dumps(plan_json_data)
+
                 await conn.execute(
                     """
                     UPDATE agent_tasks
                     SET approval_status = $1,
                         status = $2,
                         result_summary = 'Approval request expired before rejection.',
+                        plan_json = $3::jsonb,
+                        completed_at = NOW(),
                         updated_at = NOW()
-                    WHERE id = $3
+                    WHERE id = $4
                     """,
                     ApprovalStatus.EXPIRED.value,
                     TaskStatus.FAILED.value,
+                    updated_plan_json,
                     task_id,
                 )
+                await conn.execute(
+                    """
+                    UPDATE agent_task_checkpoints
+                    SET status = 'failed',
+                        error_message = 'Approval request expired before rejection.',
+                        completed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE task_id = $1 AND status IN ('awaiting_approval', 'pending', 'ready')
+                    """,
+                    task_id
+                )
                 return False, "Approval request has expired."
+
+            # Update plan_json steps so the awaiting_approval step transitions to 'cancelled'
+            plan_json_data = json.loads(row["plan_json"]) if (row.get("plan_json") and isinstance(row["plan_json"], str)) else (row.get("plan_json") or {})
+            if isinstance(plan_json_data, dict) and "steps" in plan_json_data:
+                for s in plan_json_data["steps"]:
+                    if s.get("status") == "awaiting_approval":
+                        s["status"] = "cancelled"
+                        s["error"] = rejection_msg
+            updated_plan_json = json.dumps(plan_json_data)
 
             await conn.execute(
                 """
@@ -267,14 +330,29 @@ async def reject_approval(task_id: UUID, session_id: str) -> Tuple[bool, Optiona
                     approval_status = $2,
                     approval_token = NULL,
                     approval_token_hash = NULL,
-                    result_summary = 'User rejected the requested operation.',
+                    result_summary = $3,
+                    plan_json = $4::jsonb,
                     completed_at = NOW(),
                     updated_at = NOW()
-                WHERE id = $3
+                WHERE id = $5
                 """,
                 TaskStatus.CANCELLED.value,
                 ApprovalStatus.REJECTED.value,
+                rejection_msg,
+                updated_plan_json,
                 task_id,
+            )
+            await conn.execute(
+                """
+                UPDATE agent_task_checkpoints
+                SET status = 'cancelled',
+                    error_message = $1,
+                    completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE task_id = $2 AND status IN ('awaiting_approval', 'ready', 'pending')
+                """,
+                rejection_msg,
+                task_id
             )
 
             # Record audit event atomically within the transaction (failures roll back rejection)

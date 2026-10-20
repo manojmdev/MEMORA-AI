@@ -22,7 +22,9 @@ from app.agent.models import (
     AgentTaskResponse,
     AgentExecutionEvent,
     ApprovalRequest,
-    StaleWorkerError
+    StaleWorkerError,
+    TaskFailureDetails,
+    validate_task_transition
 )
 from app.agent.intent_analyzer import analyze_intent
 from app.agent.planner import generate_plan
@@ -187,16 +189,415 @@ class AgentOrchestrator:
             updated_at=now
         )
         await self._persist_new_task(task)
+        await checkpoint_manager.init_task_checkpoints(task.id, task.session_id, plan)
 
         # 6. Execute plan steps
         return await self._execute_plan_steps(task, recalled_memories)
+
+    def _safe_compose_response(
+        self,
+        task: AgentTask,
+        recalled_memories: Optional[List[Any]] = None
+    ) -> str:
+        """Compose transparent human-readable response with deterministic fallback so synthesis failure never corrupts or repeats a task."""
+        try:
+            return compose_agent_response(task, recalled_memories)
+        except Exception as e:
+            logger.error(f"Response synthesis encountered an error for task {task.id}: {e}. Generating deterministic fallback.")
+            plan = task.plan
+            lines = [f"### 📋 Task: {plan.title if plan else task.user_request}"]
+            lines.append(f"**Status:** `{task.status.value.upper()}`")
+            if task.result_summary:
+                lines.append(f"**Summary:** {task.result_summary}")
+            if plan and plan.steps:
+                lines.append("\n**Steps:**")
+                for s in plan.steps:
+                    icon = "✅" if s.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED) else ("❌" if s.status == StepStatus.FAILED else "⏳")
+                    lines.append(f"- {icon} **{s.step_id}** ({s.tool_name or 'reasoning'}): {s.description}")
+                    if s.result:
+                        try:
+                            lines.append(f"  *Result:* `{json.dumps(s.result)[:150]}`")
+                        except Exception:
+                            lines.append(f"  *Result:* `{str(s.result)[:150]}`")
+            return "\n".join(lines)
+
+    async def _execute_single_step(
+        self,
+        task: AgentTask,
+        step: AgentPlanStep,
+        worker_id: str,
+        lease_generation: int,
+        lease_seconds: int,
+        existing_checkpoints: List[AgentTaskCheckpoint],
+        tools_executed: List[str],
+        timeline: List[Dict[str, Any]],
+        recalled_memories: Optional[List[Any]] = None
+    ) -> Tuple[bool, Optional[AgentTaskResponse]]:
+        """Execute a single step with idempotency, heartbeat lease renewal, and error handling."""
+        matching_cp = next((c for c in existing_checkpoints if c.step_id == step.step_id), None)
+
+        # 1. Skip already succeeded step (Idempotency and duplicate prevention)
+        if step.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED) or (matching_cp and matching_cp.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED)):
+            step.status = StepStatus.SUCCEEDED
+            if matching_cp and matching_cp.result is not None:
+                step.result = matching_cp.result
+            if step.tool_name:
+                tools_executed.append(step.tool_name)
+            timeline.append({
+                "step_id": step.step_id,
+                "tool": step.tool_name,
+                "status": "succeeded",
+                "duration_ms": 0,
+                "cached_checkpoint": True
+            })
+            return True, None
+
+        # 1b. Check if prior run crashed while in DISPATCHED or RUNNING (downstream reconciliation)
+        if matching_cp and matching_cp.status in (StepStatus.DISPATCHED, StepStatus.RUNNING):
+            tool = tool_registry.get_tool(step.tool_name) if step.tool_name else None
+            if tool and not tool.is_idempotent:
+                logger.info(f"Step {step.step_id} ({tool.name}) was in {matching_cp.status.value} prior to crash. Initiating downstream reconciliation.")
+                reconciled_res = await tool.reconcile(
+                    session_id=task.session_id,
+                    idempotency_key=matching_cp.idempotency_key,
+                    **step.arguments
+                )
+                if reconciled_res:
+                    logger.info(f"Reconciliation succeeded for step {step.step_id}: external operation confirmed.")
+                    step.status = StepStatus.SUCCEEDED
+                    step.result = reconciled_res
+                    await checkpoint_manager.update_checkpoint(
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        step_id=step.step_id,
+                        status=StepStatus.SUCCEEDED,
+                        result=reconciled_res,
+                        external_operation_id=reconciled_res.get("note_id") or reconciled_res.get("external_operation_id"),
+                        worker_id=worker_id,
+                        lease_generation=lease_generation,
+                        completed=True
+                    )
+                    tools_executed.append(step.tool_name)
+                    timeline.append({
+                        "step_id": step.step_id,
+                        "tool": step.tool_name,
+                        "status": "succeeded",
+                        "duration_ms": 0,
+                        "reconciled": True
+                    })
+                    return True, None
+                else:
+                    # Uncertain outcome: do NOT blindly replay!
+                    logger.warning(f"Reconciliation uncertain for step {step.step_id}. Halting and transitioning to NEEDS_RECONCILIATION.")
+                    step.status = StepStatus.NEEDS_RECONCILIATION
+                    task.status = TaskStatus.NEEDS_RECONCILIATION
+                    task.result_summary = f"Step {step.step_id} ({tool.name}) was interrupted during execution and downstream status could not be confirmed. Manual reconciliation required."
+                    await checkpoint_manager.update_checkpoint(
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        step_id=step.step_id,
+                        status=StepStatus.NEEDS_RECONCILIATION,
+                        error_message=task.result_summary,
+                        error_classification=ErrorClassification.UNKNOWN_OUTCOME,
+                        worker_id=worker_id,
+                        lease_generation=lease_generation,
+                        completed=True
+                    )
+                    await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
+                    checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+                    task.checkpoints = checkpoints
+                    reply = self._safe_compose_response(task, recalled_memories)
+                    return False, AgentTaskResponse(
+                        task=task,
+                        reply=reply,
+                        tools_executed=tools_executed,
+                        execution_timeline=timeline,
+                        checkpoints=checkpoints
+                    )
+
+        # 2. Check backend permissions (human-in-the-loop gate)
+        if step.permission == ToolPermission.APPROVAL_REQUIRED:
+            approval_req = create_approval_request(
+                task_id=task.id,
+                step_id=step.step_id,
+                tool_name=step.tool_name or "create_note",
+                arguments=step.arguments
+            )
+            step.status = StepStatus.AWAITING_APPROVAL
+            task.status = TaskStatus.AWAITING_APPROVAL
+            task.pending_approval = approval_req
+            task.approval_token = approval_req.approval_token
+            task.approval_status = ApprovalStatus.PENDING.value
+            task.approval_expires_at = approval_req.expires_at
+
+            await bind_approval_to_task(task.id, task.session_id, approval_req)
+            await checkpoint_manager.update_checkpoint(
+                task_id=task.id,
+                session_id=task.session_id,
+                step_id=step.step_id,
+                status=StepStatus.AWAITING_APPROVAL,
+                worker_id=worker_id,
+                lease_generation=lease_generation
+            )
+            await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
+
+            checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+            task.checkpoints = checkpoints
+            reply = self._safe_compose_response(task, recalled_memories)
+            return False, AgentTaskResponse(
+                task=task,
+                reply=reply,
+                memories_used=[m.model_dump(mode="json") if hasattr(m, "model_dump") else m for m in (recalled_memories or [])],
+                tools_executed=tools_executed,
+                execution_timeline=timeline,
+                checkpoints=checkpoints
+            )
+
+        # 3. Persist execution intent before dispatch
+        step_idempotency_key = step.idempotency_key or f"{task.id}:{step.step_id}"
+        step.idempotency_key = step_idempotency_key
+        await checkpoint_manager.update_checkpoint(
+            task_id=task.id,
+            session_id=task.session_id,
+            step_id=step.step_id,
+            status=StepStatus.DISPATCHED,
+            idempotency_key=step_idempotency_key,
+            worker_id=worker_id,
+            lease_generation=lease_generation,
+            started=True,
+            execution_intent_persisted=True
+        )
+
+        # 4. Checkpointed Execution & Retry loop with background heartbeat renewal
+        max_attempts = 1 + (step.max_retries if step.is_idempotent else 0)
+        attempt = 0
+        step_success = False
+        last_result = None
+
+        while attempt < max_attempts:
+            attempt += 1
+
+            if task.status == TaskStatus.CANCEL_REQUESTED:
+                step.status = StepStatus.CANCELLED
+                await checkpoint_manager.update_checkpoint(
+                    task_id=task.id,
+                    session_id=task.session_id,
+                    step_id=step.step_id,
+                    status=StepStatus.CANCELLED,
+                    worker_id=worker_id,
+                    lease_generation=lease_generation,
+                    completed=True
+                )
+                return False, None
+
+            heartbeat_stop = asyncio.Event()
+
+            async def _bg_heartbeat():
+                while not heartbeat_stop.is_set():
+                    try:
+                        await asyncio.sleep(min(15, max(1, lease_seconds // 3)))
+                        if heartbeat_stop.is_set():
+                            break
+                        ok = await self.renew_heartbeat(
+                            task_id=task.id,
+                            session_id=task.session_id,
+                            worker_id=worker_id,
+                            lease_generation=lease_generation,
+                            lease_seconds=lease_seconds
+                        )
+                        if not ok:
+                            logger.warning(f"Periodic heartbeat renewal failed for task {task.id}.")
+                            break
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.error(f"Heartbeat loop exception: {e}")
+
+            hb_task = asyncio.create_task(_bg_heartbeat())
+
+            try:
+                result = await execute_step(
+                    task_id=task.id,
+                    session_id=task.session_id,
+                    step=step,
+                    idempotency_key=step_idempotency_key
+                )
+            except asyncio.CancelledError:
+                logger.warning(f"Step {step.step_id} received in-flight cancellation signal.")
+                tool = tool_registry.get_tool(step.tool_name) if step.tool_name else None
+                if tool and not tool.is_idempotent:
+                    reconciled = await tool.reconcile(session_id=task.session_id, idempotency_key=step_idempotency_key, **step.arguments)
+                    if reconciled:
+                        step.status = StepStatus.SUCCEEDED
+                        step.result = reconciled
+                        task.status = TaskStatus.SUCCEEDED
+                        task.result_summary = "Operation completed before cancellation could take effect."
+                        await checkpoint_manager.update_checkpoint(
+                            task_id=task.id,
+                            session_id=task.session_id,
+                            step_id=step.step_id,
+                            status=StepStatus.SUCCEEDED,
+                            result=reconciled,
+                            worker_id=worker_id,
+                            lease_generation=lease_generation,
+                            completed=True
+                        )
+                    else:
+                        step.status = StepStatus.NEEDS_RECONCILIATION
+                        task.status = TaskStatus.NEEDS_RECONCILIATION
+                        task.result_summary = "In-flight cancellation during non-idempotent operation requires reconciliation."
+                        await checkpoint_manager.update_checkpoint(
+                            task_id=task.id,
+                            session_id=task.session_id,
+                            step_id=step.step_id,
+                            status=StepStatus.NEEDS_RECONCILIATION,
+                            error_message="In-flight cancellation during non-idempotent operation requires reconciliation.",
+                            error_classification=ErrorClassification.UNKNOWN_OUTCOME,
+                            worker_id=worker_id,
+                            lease_generation=lease_generation,
+                            completed=True
+                        )
+                else:
+                    step.status = StepStatus.CANCELLED
+                    task.status = TaskStatus.CANCELLED
+                    task.result_summary = "Task was cancelled by user."
+                    await checkpoint_manager.update_checkpoint(
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        step_id=step.step_id,
+                        status=StepStatus.CANCELLED,
+                        worker_id=worker_id,
+                        lease_generation=lease_generation,
+                        completed=True
+                    )
+                task.completed_at = datetime.now(timezone.utc)
+                await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
+                raise
+            finally:
+                heartbeat_stop.set()
+                hb_task.cancel()
+
+            last_result = result
+            await self.renew_heartbeat(
+                task_id=task.id,
+                session_id=task.session_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                lease_seconds=lease_seconds
+            )
+
+            if result.success:
+                step_success = True
+                step.status = StepStatus.SUCCEEDED
+                step.result = result.result
+                await checkpoint_manager.update_checkpoint(
+                    task_id=task.id,
+                    session_id=task.session_id,
+                    step_id=step.step_id,
+                    status=StepStatus.SUCCEEDED,
+                    result=result.result,
+                    external_operation_id=result.external_operation_id,
+                    worker_id=worker_id,
+                    lease_generation=lease_generation,
+                    completed=True
+                )
+                break
+            else:
+                err_cls = result.error_classification or ErrorClassification.PERMANENT
+                if err_cls == ErrorClassification.UNKNOWN_OUTCOME or (not step.is_idempotent and err_cls not in (ErrorClassification.VALIDATION_FAILURE, ErrorClassification.AUTHORIZATION_FAILURE)):
+                    logger.warning(f"Step {step.step_id} non-idempotent operation encountered unknown outcome. Transitioning to NEEDS_RECONCILIATION.")
+                    step.status = StepStatus.NEEDS_RECONCILIATION
+                    task.status = TaskStatus.NEEDS_RECONCILIATION
+                    task.result_summary = f"Step {step.step_id} requires manual reconciliation: {result.error}"
+                    await checkpoint_manager.update_checkpoint(
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        step_id=step.step_id,
+                        status=StepStatus.NEEDS_RECONCILIATION,
+                        error_message=result.error,
+                        error_classification=err_cls,
+                        worker_id=worker_id,
+                        lease_generation=lease_generation,
+                        completed=True
+                    )
+                    await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
+                    checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+                    task.checkpoints = checkpoints
+                    reply = self._safe_compose_response(task, recalled_memories)
+                    return False, AgentTaskResponse(
+                        task=task,
+                        reply=reply,
+                        tools_executed=tools_executed,
+                        execution_timeline=timeline,
+                        checkpoints=checkpoints
+                    )
+
+                if err_cls in (ErrorClassification.TRANSIENT, ErrorClassification.TIMEOUT) and step.is_idempotent and attempt < max_attempts:
+                    logger.info(f"Transient error at step {step.step_id}. Retrying attempt {attempt}/{step.max_retries}...")
+                    step.status = StepStatus.RETRYING
+                    step.retry_count = attempt
+                    await checkpoint_manager.update_checkpoint(
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        step_id=step.step_id,
+                        status=StepStatus.RETRYING,
+                        error_message=result.error,
+                        error_classification=err_cls,
+                        worker_id=worker_id,
+                        lease_generation=lease_generation,
+                        increment_retry=True
+                    )
+                    backoff = min(0.25 * (2 ** (attempt - 1)), 2.0)
+                    await asyncio.sleep(backoff)
+                    continue
+                else:
+                    break
+
+        if step.tool_name:
+            tools_executed.append(step.tool_name)
+
+        timeline.append({
+            "step_id": step.step_id,
+            "tool": step.tool_name,
+            "status": step.status.value,
+            "duration_ms": last_result.duration_ms if last_result else None
+        })
+
+        if not step_success:
+            err_cls = last_result.error_classification if last_result else ErrorClassification.PERMANENT
+            step.status = StepStatus.FAILED
+            step.error = last_result.error if last_result else "Execution failed"
+            await checkpoint_manager.update_checkpoint(
+                task_id=task.id,
+                session_id=task.session_id,
+                step_id=step.step_id,
+                status=StepStatus.FAILED,
+                error_message=step.error,
+                error_classification=err_cls,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                completed=True
+            )
+            task.failure_details = TaskFailureDetails(
+                error_category=err_cls.value if hasattr(err_cls, "value") else str(err_cls),
+                failed_step_id=step.step_id,
+                tool_name=step.tool_name,
+                failure_timestamp=datetime.now(timezone.utc),
+                is_retryable=(err_cls in (ErrorClassification.TRANSIENT, ErrorClassification.TIMEOUT) and step.is_idempotent),
+                attempt_count=attempt,
+                safe_error_message=step.error,
+                correlation_id=str(task.id)
+            )
+            return False, None
+
+        return True, None
 
     async def _execute_plan_steps(
         self,
         task: AgentTask,
         recalled_memories: Optional[List[Any]] = None
     ) -> AgentTaskResponse:
-        """Run through plan steps with durable checkpointing, worker leasing, retries, and failure reconciliation."""
+        """Run through plan steps in dependency-aware topological waves with durable checkpointing, worker leasing, retries, and failure reconciliation."""
         plan = task.plan
         if not plan:
             task.status = TaskStatus.FAILED
@@ -231,16 +632,15 @@ class AgentOrchestrator:
                 cp.step_id for cp in existing_checkpoints
                 if cp.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED)
             }
-
             for step in plan.steps:
                 matching_cp = next((c for c in existing_checkpoints if c.step_id == step.step_id), None)
-
-                # 1. Skip already succeeded step (Idempotency and duplicate prevention)
-                if step.step_id in succeeded_step_ids or step.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED):
+                if matching_cp and matching_cp.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED):
                     step.status = StepStatus.SUCCEEDED
-                    if matching_cp and matching_cp.result is not None:
+                    if matching_cp.result is not None:
                         step.result = matching_cp.result
-                    tools_executed.append(step.tool_name or "reasoning")
+                    succeeded_step_ids.add(step.step_id)
+                    if step.tool_name and step.tool_name not in tools_executed:
+                        tools_executed.append(step.tool_name)
                     timeline.append({
                         "step_id": step.step_id,
                         "tool": step.tool_name,
@@ -248,415 +648,176 @@ class AgentOrchestrator:
                         "duration_ms": 0,
                         "cached_checkpoint": True
                     })
-                    continue
 
-                # 1b. Check if prior run crashed while in DISPATCHED or RUNNING (downstream reconciliation)
-                if matching_cp and matching_cp.status in (StepStatus.DISPATCHED, StepStatus.RUNNING):
-                    tool = tool_registry.get_tool(step.tool_name) if step.tool_name else None
-                    if tool and not tool.is_idempotent:
-                        logger.info(f"Step {step.step_id} ({tool.name}) was in {matching_cp.status.value} prior to crash. Initiating downstream reconciliation.")
-                        reconciled_res = await tool.reconcile(
-                            session_id=task.session_id,
-                            idempotency_key=matching_cp.idempotency_key,
-                            **step.arguments
-                        )
-                        if reconciled_res:
-                            logger.info(f"Reconciliation succeeded for step {step.step_id}: external operation confirmed.")
-                            step.status = StepStatus.SUCCEEDED
-                            step.result = reconciled_res
-                            await checkpoint_manager.update_checkpoint(
-                                task_id=task.id,
-                                session_id=task.session_id,
-                                step_id=step.step_id,
-                                status=StepStatus.SUCCEEDED,
-                                result=reconciled_res,
-                                external_operation_id=reconciled_res.get("note_id") or reconciled_res.get("external_operation_id"),
-                                worker_id=worker_id,
-                                lease_generation=lease_generation,
-                                completed=True
-                            )
-                            tools_executed.append(step.tool_name)
-                            timeline.append({
-                                "step_id": step.step_id,
-                                "tool": step.tool_name,
-                                "status": "succeeded",
-                                "duration_ms": 0,
-                                "reconciled": True
-                            })
-                            continue
-                        else:
-                            # Uncertain outcome: do NOT blindly replay!
-                            logger.warning(f"Reconciliation uncertain for step {step.step_id}. Halting and transitioning to NEEDS_RECONCILIATION.")
-                            step.status = StepStatus.NEEDS_RECONCILIATION
-                            task.status = TaskStatus.NEEDS_RECONCILIATION
-                            task.result_summary = f"Step {step.step_id} ({tool.name}) was interrupted during execution and downstream status could not be confirmed. Manual reconciliation required."
-                            await checkpoint_manager.update_checkpoint(
-                                task_id=task.id,
-                                session_id=task.session_id,
-                                step_id=step.step_id,
-                                status=StepStatus.NEEDS_RECONCILIATION,
-                                error_message=task.result_summary,
-                                error_classification=ErrorClassification.UNKNOWN_OUTCOME,
-                                worker_id=worker_id,
-                                lease_generation=lease_generation,
-                                completed=True
-                            )
-                            await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
-                            checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
-                            task.checkpoints = checkpoints
-                            reply = compose_agent_response(task, recalled_memories)
-                            return AgentTaskResponse(
-                                task=task,
-                                reply=reply,
-                                tools_executed=tools_executed,
-                                execution_timeline=timeline,
-                                checkpoints=checkpoints
-                            )
-
-                # 2. Check dependencies: if any preceding dependency failed/skipped, skip this step
-                dep_failed = False
-                for dep_id in step.dependencies:
-                    dep_step = next((s for s in plan.steps if s.step_id == dep_id), None)
-                    if dep_step and dep_step.status not in (StepStatus.SUCCEEDED, StepStatus.COMPLETED):
-                        dep_failed = True
-                        break
-
-                if dep_failed:
-                    step.status = StepStatus.SKIPPED
-                    step.error = "Skipped due to dependency failure."
-                    await checkpoint_manager.update_checkpoint(
-                        task_id=task.id,
-                        session_id=task.session_id,
-                        step_id=step.step_id,
-                        status=StepStatus.SKIPPED,
-                        error_message=step.error,
-                        worker_id=worker_id,
-                        lease_generation=lease_generation,
-                        completed=True
-                    )
-                    timeline.append({"step_id": step.step_id, "status": "skipped"})
-                    continue
-
-                # 3. Check backend permissions (human-in-the-loop gate)
-                if step.permission == ToolPermission.APPROVAL_REQUIRED:
-                    approval_req = create_approval_request(
-                        task_id=task.id,
-                        step_id=step.step_id,
-                        tool_name=step.tool_name or "create_note",
-                        arguments=step.arguments
-                    )
-                    step.status = StepStatus.AWAITING_APPROVAL
-                    task.status = TaskStatus.AWAITING_APPROVAL
-                    task.pending_approval = approval_req
-                    task.approval_token = approval_req.approval_token
-                    task.approval_status = ApprovalStatus.PENDING.value
-                    task.approval_expires_at = approval_req.expires_at
-
-                    await bind_approval_to_task(task.id, task.session_id, approval_req)
-                    await checkpoint_manager.update_checkpoint(
-                        task_id=task.id,
-                        session_id=task.session_id,
-                        step_id=step.step_id,
-                        status=StepStatus.AWAITING_APPROVAL,
-                        worker_id=worker_id,
-                        lease_generation=lease_generation
-                    )
-                    await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
-
-                    checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
-                    task.checkpoints = checkpoints
-                    reply = compose_agent_response(task, recalled_memories)
-                    return AgentTaskResponse(
-                        task=task,
-                        reply=reply,
-                        memories_used=[m.model_dump(mode="json") if hasattr(m, "model_dump") else m for m in (recalled_memories or [])],
-                        tools_executed=tools_executed,
-                        execution_timeline=timeline,
-                        checkpoints=checkpoints
-                    )
-
-                # 4. Enforce tool execution count limit per task
-                tool_exec_count += 1
-                if tool_exec_count > MAX_TOOL_EXECUTIONS_PER_TASK:
-                    step.status = StepStatus.FAILED
-                    step.error = f"Exceeded maximum limit of {MAX_TOOL_EXECUTIONS_PER_TASK} tool executions per task."
-                    step.error_classification = ErrorClassification.PERMANENT
-                    task.status = TaskStatus.FAILED
-                    task.result_summary = step.error
+            while True:
+                if task.status == TaskStatus.CANCEL_REQUESTED:
+                    task.status = TaskStatus.CANCELLED
                     task.completed_at = datetime.now(timezone.utc)
-                    await checkpoint_manager.update_checkpoint(
-                        task_id=task.id,
-                        session_id=task.session_id,
-                        step_id=step.step_id,
-                        status=StepStatus.FAILED,
-                        error_message=step.error,
-                        error_classification=ErrorClassification.PERMANENT,
-                        worker_id=worker_id,
-                        lease_generation=lease_generation,
-                        completed=True
-                    )
+                    task.result_summary = "Task was cancelled by user."
+                    await checkpoint_manager.cancel_pending_checkpoints(task.id, task.session_id)
                     await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
-                    checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
-                    task.checkpoints = checkpoints
-                    reply = compose_agent_response(task, recalled_memories)
-                    return AgentTaskResponse(
-                        task=task,
-                        reply=reply,
-                        tools_executed=tools_executed,
-                        execution_timeline=timeline,
-                        checkpoints=checkpoints
-                    )
+                    break
 
-                # 5. Persist execution intent before dispatch
-                step_idempotency_key = step.idempotency_key or f"{task.id}:{step.step_id}"
-                step.idempotency_key = step_idempotency_key
-                await checkpoint_manager.update_checkpoint(
-                    task_id=task.id,
-                    session_id=task.session_id,
-                    step_id=step.step_id,
-                    status=StepStatus.DISPATCHED,
-                    idempotency_key=step_idempotency_key,
-                    worker_id=worker_id,
-                    lease_generation=lease_generation,
-                    started=True,
-                    execution_intent_persisted=True
-                )
-
-                # 6. Checkpointed Execution & Retry loop with background heartbeat renewal
-                max_attempts = 1 + (step.max_retries if step.is_idempotent else 0)
-                attempt = 0
-                step_success = False
-                last_result = None
-
-                while attempt < max_attempts:
-                    attempt += 1
-
-                    if task.status == TaskStatus.CANCEL_REQUESTED:
-                        step.status = StepStatus.CANCELLED
-                        await checkpoint_manager.update_checkpoint(
-                            task_id=task.id,
-                            session_id=task.session_id,
-                            step_id=step.step_id,
-                            status=StepStatus.CANCELLED,
-                            worker_id=worker_id,
-                            lease_generation=lease_generation,
-                            completed=True
-                        )
-                        break
-
-                    heartbeat_stop = asyncio.Event()
-
-                    async def _bg_heartbeat():
-                        while not heartbeat_stop.is_set():
-                            try:
-                                await asyncio.sleep(min(15, max(1, lease_seconds // 3)))
-                                if heartbeat_stop.is_set():
-                                    break
-                                ok = await self.renew_heartbeat(
-                                    task_id=task.id,
-                                    session_id=task.session_id,
-                                    worker_id=worker_id,
-                                    lease_generation=lease_generation,
-                                    lease_seconds=lease_seconds
-                                )
-                                if not ok:
-                                    logger.warning(f"Periodic heartbeat renewal failed for task {task.id}.")
-                                    break
-                            except asyncio.CancelledError:
-                                break
-                            except Exception as e:
-                                logger.error(f"Heartbeat loop exception: {e}")
-
-                    hb_task = asyncio.create_task(_bg_heartbeat())
-
-                    try:
-                        result = await execute_step(
-                            task_id=task.id,
-                            session_id=task.session_id,
-                            step=step,
-                            idempotency_key=step_idempotency_key
-                        )
-                    except asyncio.CancelledError:
-                        logger.warning(f"Step {step.step_id} received in-flight cancellation signal.")
-                        tool = tool_registry.get_tool(step.tool_name) if step.tool_name else None
-                        if tool and not tool.is_idempotent:
-                            reconciled = await tool.reconcile(session_id=task.session_id, idempotency_key=step_idempotency_key, **step.arguments)
-                            if reconciled:
-                                step.status = StepStatus.SUCCEEDED
-                                step.result = reconciled
-                                task.status = TaskStatus.SUCCEEDED
-                                task.result_summary = "Operation completed before cancellation could take effect."
-                                await checkpoint_manager.update_checkpoint(
-                                    task_id=task.id,
-                                    session_id=task.session_id,
-                                    step_id=step.step_id,
-                                    status=StepStatus.SUCCEEDED,
-                                    result=reconciled,
-                                    worker_id=worker_id,
-                                    lease_generation=lease_generation,
-                                    completed=True
-                                )
-                            else:
-                                step.status = StepStatus.NEEDS_RECONCILIATION
-                                task.status = TaskStatus.NEEDS_RECONCILIATION
-                                task.result_summary = "In-flight cancellation during non-idempotent operation requires reconciliation."
-                                await checkpoint_manager.update_checkpoint(
-                                    task_id=task.id,
-                                    session_id=task.session_id,
-                                    step_id=step.step_id,
-                                    status=StepStatus.NEEDS_RECONCILIATION,
-                                    error_message="In-flight cancellation during non-idempotent operation requires reconciliation.",
-                                    error_classification=ErrorClassification.UNKNOWN_OUTCOME,
-                                    worker_id=worker_id,
-                                    lease_generation=lease_generation,
-                                    completed=True
-                                )
-                        else:
-                            step.status = StepStatus.CANCELLED
-                            task.status = TaskStatus.CANCELLED
-                            task.result_summary = "Task was cancelled by user."
+                # Mark any pending step whose dependencies failed/skipped as SKIPPED
+                failed_or_skipped_ids = {
+                    s.step_id for s in plan.steps
+                    if s.status in (StepStatus.FAILED, StepStatus.SKIPPED, StepStatus.CANCELLED, StepStatus.NEEDS_RECONCILIATION)
+                }
+                for s in plan.steps:
+                    if s.status in (StepStatus.PENDING, StepStatus.READY):
+                        if any(dep in failed_or_skipped_ids for dep in s.dependencies):
+                            s.status = StepStatus.SKIPPED
+                            s.error = "Skipped due to failure or cancellation of prerequisite step."
                             await checkpoint_manager.update_checkpoint(
                                 task_id=task.id,
                                 session_id=task.session_id,
-                                step_id=step.step_id,
-                                status=StepStatus.CANCELLED,
+                                step_id=s.step_id,
+                                status=StepStatus.SKIPPED,
+                                error_message=s.error,
                                 worker_id=worker_id,
                                 lease_generation=lease_generation,
                                 completed=True
                             )
-                        task.completed_at = datetime.now(timezone.utc)
-                        await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
-                        raise
-                    finally:
-                        heartbeat_stop.set()
-                        hb_task.cancel()
+                            timeline.append({"step_id": s.step_id, "status": "skipped"})
 
-                    last_result = result
-                    await self.renew_heartbeat(
-                        task_id=task.id,
-                        session_id=task.session_id,
+                # Find ready steps whose dependencies are all satisfied
+                ready_steps = [
+                    s for s in plan.steps
+                    if s.status in (StepStatus.PENDING, StepStatus.READY)
+                    and all(dep in succeeded_step_ids for dep in s.dependencies)
+                ]
+
+                if not ready_steps:
+                    # No more reachable steps
+                    break
+
+                # Enforce max tool limit
+                tool_exec_count += len(ready_steps)
+                if tool_exec_count > MAX_TOOL_EXECUTIONS_PER_TASK * 2:
+                    task.status = TaskStatus.FAILED
+                    task.result_summary = f"Exceeded maximum limit of {MAX_TOOL_EXECUTIONS_PER_TASK} tool executions per task."
+                    task.completed_at = datetime.now(timezone.utc)
+                    break
+
+                # Check for approval-required steps in ready steps
+                approval_steps = [s for s in ready_steps if s.permission == ToolPermission.APPROVAL_REQUIRED]
+                automatic_steps = [s for s in ready_steps if s.permission != ToolPermission.APPROVAL_REQUIRED]
+
+                if approval_steps and not automatic_steps:
+                    # Halt on approval step
+                    step_to_approve = approval_steps[0]
+                    ok, early_resp = await self._execute_single_step(
+                        task=task,
+                        step=step_to_approve,
                         worker_id=worker_id,
                         lease_generation=lease_generation,
-                        lease_seconds=lease_seconds
+                        lease_seconds=lease_seconds,
+                        existing_checkpoints=existing_checkpoints,
+                        tools_executed=tools_executed,
+                        timeline=timeline,
+                        recalled_memories=recalled_memories
                     )
+                    if early_resp:
+                        return early_resp
+                    break
 
-                    if result.success:
-                        step_success = True
-                        await checkpoint_manager.update_checkpoint(
-                            task_id=task.id,
-                            session_id=task.session_id,
-                            step_id=step.step_id,
-                            status=StepStatus.SUCCEEDED,
-                            result=result.result,
-                            external_operation_id=result.external_operation_id,
-                            worker_id=worker_id,
-                            lease_generation=lease_generation,
-                            completed=True
-                        )
-                        break
+                steps_to_run = automatic_steps if automatic_steps else [approval_steps[0]]
+
+                if len(steps_to_run) == 1:
+                    ok, early_resp = await self._execute_single_step(
+                        task=task,
+                        step=steps_to_run[0],
+                        worker_id=worker_id,
+                        lease_generation=lease_generation,
+                        lease_seconds=lease_seconds,
+                        existing_checkpoints=existing_checkpoints,
+                        tools_executed=tools_executed,
+                        timeline=timeline,
+                        recalled_memories=recalled_memories
+                    )
+                    if early_resp:
+                        return early_resp
+                    if ok:
+                        succeeded_step_ids.add(steps_to_run[0].step_id)
                     else:
-                        err_cls = result.error_classification or ErrorClassification.PERMANENT
+                        task.status = TaskStatus.FAILED
+                        task.completed_at = datetime.now(timezone.utc)
+                        task.result_summary = f"Execution failed at {steps_to_run[0].step_id} ({steps_to_run[0].tool_name}): {steps_to_run[0].error or 'Unknown error'}"
+                        # Continue loop to allow independent branches to finish while skipping downstream of failed step
+                else:
+                    # Execute independent steps concurrently via asyncio.gather
+                    logger.info(f"Executing {len(steps_to_run)} independent steps concurrently: {[s.step_id for s in steps_to_run]}")
+                    results = await asyncio.gather(*[
+                        self._execute_single_step(
+                            task=task,
+                            step=st,
+                            worker_id=worker_id,
+                            lease_generation=lease_generation,
+                            lease_seconds=lease_seconds,
+                            existing_checkpoints=existing_checkpoints,
+                            tools_executed=tools_executed,
+                            timeline=timeline,
+                            recalled_memories=recalled_memories
+                        )
+                        for st in steps_to_run
+                    ])
+                    batch_failed = False
+                    for (ok, early_resp), st in zip(results, steps_to_run):
+                        if early_resp:
+                            return early_resp
+                        if ok:
+                            succeeded_step_ids.add(st.step_id)
+                        else:
+                            batch_failed = True
+                    if batch_failed:
+                        task.status = TaskStatus.FAILED
+                        task.completed_at = datetime.now(timezone.utc)
+                        task.result_summary = "One or more independent steps failed during execution."
+                        # Continue loop to allow independent branches to finish while skipping downstream of failed step
 
-                        # Check for unknown outcome on non-idempotent operation
-                        if err_cls == ErrorClassification.UNKNOWN_OUTCOME or (not step.is_idempotent and err_cls not in (ErrorClassification.VALIDATION_FAILURE, ErrorClassification.AUTHORIZATION_FAILURE)):
-                            logger.warning(f"Step {step.step_id} non-idempotent operation encountered unknown outcome. Transitioning to NEEDS_RECONCILIATION.")
-                            step.status = StepStatus.NEEDS_RECONCILIATION
-                            task.status = TaskStatus.NEEDS_RECONCILIATION
-                            task.result_summary = f"Step {step.step_id} requires manual reconciliation: {result.error}"
+            # Final pass: mark any remaining pending step whose prerequisites failed/cancelled as SKIPPED
+            failed_or_skipped_ids = {
+                s.step_id for s in plan.steps
+                if s.status in (StepStatus.FAILED, StepStatus.SKIPPED, StepStatus.CANCELLED, StepStatus.NEEDS_RECONCILIATION)
+            }
+            if failed_or_skipped_ids:
+                for s in plan.steps:
+                    if s.status in (StepStatus.PENDING, StepStatus.READY):
+                        if any(dep in failed_or_skipped_ids for dep in s.dependencies):
+                            s.status = StepStatus.SKIPPED
+                            s.error = "Skipped due to failure or cancellation of prerequisite step."
                             await checkpoint_manager.update_checkpoint(
                                 task_id=task.id,
                                 session_id=task.session_id,
-                                step_id=step.step_id,
-                                status=StepStatus.NEEDS_RECONCILIATION,
-                                error_message=result.error,
-                                error_classification=err_cls,
+                                step_id=s.step_id,
+                                status=StepStatus.SKIPPED,
+                                error_message=s.error,
                                 worker_id=worker_id,
                                 lease_generation=lease_generation,
                                 completed=True
                             )
-                            await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
-                            checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
-                            task.checkpoints = checkpoints
-                            reply = compose_agent_response(task, recalled_memories)
-                            return AgentTaskResponse(
-                                task=task,
-                                reply=reply,
-                                tools_executed=tools_executed,
-                                execution_timeline=timeline,
-                                checkpoints=checkpoints
-                            )
+                            timeline.append({"step_id": s.step_id, "status": "skipped"})
+                            failed_or_skipped_ids.add(s.step_id)
 
-                        # Safe retry for transient errors on idempotent tools
-                        if err_cls in (ErrorClassification.TRANSIENT, ErrorClassification.TIMEOUT) and step.is_idempotent and attempt < max_attempts:
-                            logger.info(f"Transient error at step {step.step_id}. Retrying attempt {attempt}/{step.max_retries}...")
-                            step.status = StepStatus.RETRYING
-                            step.retry_count = attempt
-                            await checkpoint_manager.update_checkpoint(
-                                task_id=task.id,
-                                session_id=task.session_id,
-                                step_id=step.step_id,
-                                status=StepStatus.RETRYING,
-                                error_message=result.error,
-                                error_classification=err_cls,
-                                worker_id=worker_id,
-                                lease_generation=lease_generation,
-                                increment_retry=True
-                            )
-                            backoff = min(0.25 * (2 ** (attempt - 1)), 2.0)
-                            await asyncio.sleep(backoff)
-                            continue
-                        else:
-                            break
+            # Final status determination
+            all_steps_done = all(s.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED) for s in plan.steps)
+            if all_steps_done:
+                task.status = TaskStatus.SUCCEEDED
+                task.completed_at = datetime.now(timezone.utc)
+                task.result_summary = f"All {len(plan.steps)} plan steps executed successfully."
+            elif any(s.status == StepStatus.NEEDS_RECONCILIATION for s in plan.steps):
+                task.status = TaskStatus.NEEDS_RECONCILIATION
+            elif any(s.status == StepStatus.AWAITING_APPROVAL for s in plan.steps):
+                task.status = TaskStatus.AWAITING_APPROVAL
+            elif any(s.status == StepStatus.CANCELLED for s in plan.steps):
+                task.status = TaskStatus.CANCELLED
+            elif any(s.status == StepStatus.FAILED for s in plan.steps):
+                task.status = TaskStatus.FAILED
 
-                if step.tool_name:
-                    tools_executed.append(step.tool_name)
-
-                timeline.append({
-                    "step_id": step.step_id,
-                    "tool": step.tool_name,
-                    "status": step.status.value,
-                    "duration_ms": last_result.duration_ms if last_result else None
-                })
-
-                if not step_success:
-                    err_cls = last_result.error_classification if last_result else ErrorClassification.PERMANENT
-                    step.status = StepStatus.FAILED
-                    task.status = TaskStatus.FAILED
-                    task.result_summary = f"Execution failed at {step.step_id} ({step.tool_name}): {last_result.error if last_result else 'Unknown error'}"
-                    task.completed_at = datetime.now(timezone.utc)
-                    await checkpoint_manager.update_checkpoint(
-                        task_id=task.id,
-                        session_id=task.session_id,
-                        step_id=step.step_id,
-                        status=StepStatus.FAILED,
-                        error_message=last_result.error if last_result else "Execution failed",
-                        error_classification=err_cls,
-                        worker_id=worker_id,
-                        lease_generation=lease_generation,
-                        completed=True
-                    )
-                    await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
-                    checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
-                    task.checkpoints = checkpoints
-                    reply = compose_agent_response(task, recalled_memories)
-                    return AgentTaskResponse(
-                        task=task,
-                        reply=reply,
-                        memories_used=[m.model_dump(mode="json") if hasattr(m, "model_dump") else m for m in (recalled_memories or [])],
-                        tools_executed=tools_executed,
-                        execution_timeline=timeline,
-                        checkpoints=checkpoints
-                    )
-
-            # All steps succeeded
-            task.status = TaskStatus.SUCCEEDED
-            task.completed_at = datetime.now(timezone.utc)
-            task.result_summary = f"All {len(plan.steps)} plan steps executed successfully."
             await self._update_task_record(task, worker_id=worker_id, lease_generation=lease_generation)
-
             checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
             task.checkpoints = checkpoints
-            reply = compose_agent_response(task, recalled_memories)
+            reply = self._safe_compose_response(task, recalled_memories)
             return AgentTaskResponse(
                 task=task,
                 reply=reply,
@@ -667,7 +828,7 @@ class AgentOrchestrator:
             )
         finally:
             self._active_tasks.pop(task.id, None)
-        reply = compose_agent_response(task, recalled_memories)
+        reply = self._safe_compose_response(task, recalled_memories)
         return AgentTaskResponse(
             task=task,
             reply=reply,
@@ -746,6 +907,8 @@ class AgentOrchestrator:
     ) -> AgentTaskResponse:
         """Cancel an in-flight, awaiting_approval, or paused task safely."""
         clean_session = session_id.strip()
+        if isinstance(task_id, str):
+            task_id = UUID(task_id)
         task = await self.get_task(clean_session, task_id)
         if not task:
             raise ValueError("Task not found or access denied for this session.")
@@ -801,6 +964,8 @@ class AgentOrchestrator:
     ) -> AgentTaskResponse:
         """Resume execution of a failed, paused, or reconciled task from its last checkpoint."""
         clean_session = session_id.strip()
+        if isinstance(task_id, str):
+            task_id = UUID(task_id)
         task = await self.get_task(clean_session, task_id)
         if not task or not task.plan:
             raise ValueError("Task or plan could not be restored for retry.")
@@ -995,9 +1160,15 @@ class AgentOrchestrator:
         Sprint 3.1: Monotonically increasing fencing token (lease_generation) lease claim.
         Conditional database update requiring the task to be unassigned, expired, or already owned.
         """
+        if isinstance(task_id, str):
+            task_id = UUID(task_id)
+
         pool = await get_db_pool()
         if pool is None:
-            return False, 0, "Database pool unavailable."
+            return False
+
+        if isinstance(task_id, str):
+            task_id = UUID(task_id), 0, "Database pool unavailable."
 
         eff_worker_id = worker_id or WorkerIdentity.get_worker_id()
         now_utc = datetime.now(timezone.utc)
@@ -1057,6 +1228,9 @@ class AgentOrchestrator:
         pool = await get_db_pool()
         if pool is None:
             return False
+
+        if isinstance(task_id, str):
+            task_id = UUID(task_id)
 
         eff_worker_id = worker_id or WorkerIdentity.get_worker_id()
         duration_sec = lease_seconds if lease_seconds is not None else (lease_minutes * 60 if lease_minutes is not None else getattr(settings, "WORKER_LEASE_MINUTES", 5) * 60)
@@ -1158,6 +1332,19 @@ class AgentOrchestrator:
         if pool is None:
             return
 
+        # Ensure a task cannot become SUCCEEDED/COMPLETED if any required step failed
+        if task.status in (TaskStatus.SUCCEEDED, TaskStatus.COMPLETED) and task.plan:
+            has_failed_step = any(
+                s.status in (StepStatus.FAILED, StepStatus.NEEDS_RECONCILIATION, StepStatus.CANCELLED)
+                for s in task.plan.steps
+            )
+            if has_failed_step:
+                logger.error(
+                    f"Integrity violation: Task {task.id} attempted to become {task.status.value} "
+                    f"while containing failed/cancelled steps. Forcing status to FAILED."
+                )
+                task.status = TaskStatus.FAILED
+
         plan_json_str = task.plan.model_dump_json() if task.plan else None
         now_utc = datetime.now(timezone.utc)
         is_running = (task.status == TaskStatus.RUNNING)
@@ -1196,6 +1383,11 @@ class AgentOrchestrator:
                       $13::int IS NULL
                       OR lease_generation IS NULL
                       OR lease_generation <= $13::int
+                  )
+                  AND (
+                      status NOT IN ('succeeded', 'completed', 'cancelled')
+                      OR $2 IN ('succeeded', 'completed', 'cancelled')
+                      OR ($2 IN ('retrying', 'running') AND $13::int > COALESCE(lease_generation, 0))
                   )
                 RETURNING lease_generation;
                 """,

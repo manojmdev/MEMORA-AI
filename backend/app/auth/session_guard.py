@@ -280,6 +280,13 @@ async def get_current_principal(
                     is_demo_mode=True,
                     auth_provider="development_bearer_test"
                 )
+            # If explicit AUTH_SECRET_KEY or API_AUTH_TOKENS is configured or token was explicitly malformed/signed, reject with 401
+            if settings.AUTH_SECRET_KEY or settings.API_AUTH_TOKENS or "." in raw_token:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid or unverified authentication token.",
+                    headers={"WWW-Authenticate": "Bearer"}
+                )
 
     effective_sid = x_session_id or session_id
     if not effective_sid or not str(effective_sid).strip():
@@ -303,7 +310,9 @@ def verify_session_ownership(requested_session_id: str, principal: UserPrincipal
     Verify that the requested session matches the authenticated principal's authorized scope.
     """
     clean_sid = validate_session_format(requested_session_id)
-    if settings.ENVIRONMENT.lower() == "production":
+    is_production = settings.ENVIRONMENT.lower() == "production"
+
+    if is_production:
         if not principal.is_authenticated:
             raise HTTPException(
                 status_code=401,
@@ -314,6 +323,9 @@ def verify_session_ownership(requested_session_id: str, principal: UserPrincipal
                 status_code=403,
                 detail="The 'default-session' identifier is prohibited in production mode."
             )
+
+    # Cross-session isolation: authenticated principals cannot access foreign sessions in any environment
+    if principal.is_authenticated:
         if principal.allowed_sessions is not None:
             if clean_sid not in principal.allowed_sessions:
                 logger.warning(f"Ownership violation attempt: Principal '{principal.id}' tried to access session '{clean_sid}'.")
@@ -361,7 +373,12 @@ def validate_session_id(session_id: Optional[str], principal: Optional[UserPrinc
             )
         return clean_sid
 
-    # Development / demo mode
+    # Development / demo mode: enforce ownership if caller is authenticated
+    if principal is not None and principal.is_authenticated:
+        if not session_id or not str(session_id).strip():
+            return principal.session_id
+        return verify_session_ownership(session_id, principal)
+
     if not session_id or not str(session_id).strip():
         if principal:
             return principal.session_id

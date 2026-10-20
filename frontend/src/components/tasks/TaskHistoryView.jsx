@@ -25,7 +25,13 @@ export function TaskHistoryView({
 
   const filteredTasks = useMemo(() => {
     return (tasks || []).filter((t) => {
-      if (statusFilter !== "all" && t.status !== statusFilter) return false;
+      if (statusFilter !== "all") {
+        if (statusFilter === "completed") {
+          if (t.status !== "completed" && t.status !== "succeeded") return false;
+        } else if (t.status !== statusFilter) {
+          return false;
+        }
+      }
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
         const matchInst = t.instruction?.toLowerCase().includes(q);
@@ -136,9 +142,9 @@ export function TaskHistoryView({
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
           {filteredTasks.map((t) => {
-            const isCompleted = t.status === "completed";
+            const isCompleted = t.status === "completed" || t.status === "succeeded";
             const isPending = t.status === "awaiting_approval";
-            const isFailed = t.status === "failed";
+            const isFailed = t.status === "failed" || t.status === "needs_reconciliation";
 
             return (
               <div
@@ -295,10 +301,12 @@ export function TaskHistoryView({
                     </div>
                     <span
                       className={`badge ${
-                        st.status === "completed"
+                        st.status === "completed" || st.status === "succeeded"
                           ? "badge-emerald"
                           : st.status === "failed"
                           ? "badge-rose"
+                          : st.status === "awaiting_approval"
+                          ? "badge-amber"
                           : "badge-neutral"
                       }`}
                     >
@@ -308,6 +316,25 @@ export function TaskHistoryView({
                 ))}
               </div>
             </div>
+
+            {/* Failure Diagnostics if Failed */}
+            {(inspectingTask.status === "failed" || inspectingTask.status === "needs_reconciliation") && (
+              <div
+                style={{
+                  background: "rgba(239, 68, 68, 0.08)",
+                  border: "1px solid var(--color-danger-border, rgba(239, 68, 68, 0.3))",
+                  borderRadius: "8px",
+                  padding: "12px",
+                }}
+              >
+                <div style={{ color: "var(--color-danger)", fontWeight: 600, fontSize: "0.82rem", marginBottom: "4px" }}>
+                  Failure Diagnostics
+                </div>
+                <div style={{ color: "var(--text-primary)", fontSize: "0.8rem", lineHeight: 1.4 }}>
+                  {inspectingTask.failure_details?.safe_error_message || inspectingTask.result_summary || inspectingTask.error_message || "Task failed during step execution."}
+                </div>
+              </div>
+            )}
 
             {/* Response Output */}
             {inspectingTask.response && (
