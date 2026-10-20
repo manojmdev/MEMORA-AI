@@ -287,73 +287,6 @@ async def get_memories(
     except Exception as e:
         raise safe_internal_error(e, "Failed to fetch memories", req)
 
-@app.get("/api/memories/{memory_id}", response_model=MemoryRecord)
-async def get_single_memory(
-    memory_id: UUID,
-    req: Request,
-    session_id: str = Query(default="default-session", description="Session identifier"),
-    principal: UserPrincipal = Depends(get_current_principal)
-):
-    valid_sid = validate_session_id(session_id, principal)
-    try:
-        mem = await get_memory(session_id=valid_sid, memory_id=memory_id)
-        if not mem:
-            raise HTTPException(status_code=404, detail="Memory not found or does not belong to this session.")
-        return mem
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise safe_internal_error(e, f"Error fetching memory {memory_id}", req)
-
-@app.patch("/api/memories/{memory_id}", response_model=MemoryRecord)
-async def patch_memory(
-    memory_id: UUID,
-    request: UpdateMemoryRequest,
-    req: Request,
-    session_id: str = Query(default="default-session", description="Session identifier"),
-    principal: UserPrincipal = Depends(get_current_principal)
-):
-    """Update fields on a specific memory record, enforcing session scope."""
-    valid_sid = validate_session_id(session_id, principal)
-    try:
-        updated = await update_memory(
-            session_id=valid_sid,
-            memory_id=memory_id,
-            content=request.content,
-            confidence_score=request.confidence_score,
-            category=request.category,
-            is_active=request.is_active
-        )
-        if not updated:
-            raise HTTPException(status_code=404, detail="Memory not found or does not belong to this session.")
-        return updated
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise safe_internal_error(e, f"Error updating memory {memory_id}", req)
-
-@app.delete("/api/memories/{memory_id}", response_model=DeleteResponse)
-async def remove_memory(
-    memory_id: UUID,
-    req: Request,
-    session_id: str = Query(default="default-session", description="Session identifier"),
-    principal: UserPrincipal = Depends(get_current_principal)
-):
-    valid_sid = validate_session_id(session_id, principal)
-    try:
-        deleted = await delete_memory(session_id=valid_sid, memory_id=memory_id)
-        if not deleted:
-            raise HTTPException(status_code=404, detail="Memory not found or does not belong to this session.")
-        return DeleteResponse(
-            session_id=valid_sid,
-            message="Memory deleted successfully.",
-            deleted_count=1
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise safe_internal_error(e, f"Error deleting memory {memory_id}", req)
-
 @app.delete("/api/memories", response_model=DeleteResponse)
 async def clear_session_memories(
     req: Request,
@@ -1035,6 +968,74 @@ async def get_memory_dashboard_metrics(
         raise
     except Exception as e:
         raise safe_internal_error(e, "Failed to generate dashboard metrics", req)
+
+@app.get("/api/memories/{memory_id}", response_model=MemoryRecord)
+async def get_single_memory(
+    memory_id: UUID,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        mem = await get_memory(session_id=valid_sid, memory_id=memory_id)
+        if not mem:
+            raise HTTPException(status_code=404, detail="Memory not found or does not belong to this session.")
+        return mem
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, f"Error fetching memory {memory_id}", req)
+
+@app.patch("/api/memories/{memory_id}", response_model=MemoryRecord)
+async def patch_memory(
+    memory_id: UUID,
+    request: UpdateMemoryRequest,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Update fields on a specific memory record, enforcing session scope."""
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        updated = await update_memory(
+            session_id=valid_sid,
+            memory_id=memory_id,
+            content=request.content,
+            confidence_score=request.confidence_score,
+            category=request.category,
+            is_active=request.is_active
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail="Memory not found or does not belong to this session.")
+        return updated
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, f"Error updating memory {memory_id}", req)
+
+@app.delete("/api/memories/{memory_id}", response_model=DeleteResponse)
+async def remove_memory(
+    memory_id: UUID,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        deleted = await delete_memory(session_id=valid_sid, memory_id=memory_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Memory not found or does not belong to this session.")
+        return DeleteResponse(
+            session_id=valid_sid,
+            message="Memory deleted successfully.",
+            deleted_count=1
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, f"Error deleting memory {memory_id}", req)
+
 
 
 
