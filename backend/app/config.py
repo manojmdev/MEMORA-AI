@@ -16,7 +16,9 @@ class Settings(BaseSettings):
 
     # Day 4: Semantic and Hybrid Retrieval
     EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-8B"
+    NEBIUS_EMBEDDING_MODEL: Optional[str] = None
     EMBEDDING_DIMENSION: int = 1024
+    EMBEDDING_DIM: Optional[int] = None
     EMBEDDING_API_BASE_URL: str = "https://api.tokenfactory.nebius.com/v1"
     SIMILARITY_THRESHOLD: float = 0.58
     KEYWORD_WEIGHT: float = 0.50
