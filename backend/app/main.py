@@ -24,11 +24,13 @@ from app.schemas import (
     MemoryLifecycleStats,
     MemoryExplanationResponse,
     MemoryDashboardStats,
+    UpdateMemoryRequest,
 )
 from app.services.memory_context import generate_personalized_response
 from app.services.memory_service import (
     list_memories,
     get_memory,
+    update_memory,
     delete_memory,
     delete_all_memories,
     backfill_missing_embeddings
@@ -54,6 +56,7 @@ from app.agent.models import (
 )
 from app.agent.orchestrator import agent_orchestrator
 from app.agent.checkpoint_manager import checkpoint_manager
+from app.agent.worker_identity import WorkerIdentity
 from app.services import note_service
 from app.database import init_db_pool, close_db_pool, check_db_health, recover_interrupted_tasks
 from app.auth.session_guard import validate_session_id, get_current_principal, UserPrincipal
@@ -115,11 +118,22 @@ async def correlation_id_middleware(request: Request, call_next):
     response.headers["X-Request-ID"] = corr_id
     return response
 
+cors_origins = [
+    settings.FRONTEND_ORIGIN,
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://localhost:4173",
+]
+if settings.FRONTEND_ORIGIN and "," in settings.FRONTEND_ORIGIN:
+    cors_origins.extend([o.strip() for o in settings.FRONTEND_ORIGIN.split(",") if o.strip()])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_ORIGIN, "http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=list(dict.fromkeys(cors_origins)),
+    allow_origin_regex=r"^https:\/\/.*\.vercel\.app$",
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -129,6 +143,25 @@ async def root():
         "message": "Welcome to MEMORA AI API",
         "status": "running",
         "engine": "Memory Evolution Engine v1"
+    }
+
+@app.get("/api/system/info")
+async def get_system_info():
+    """Return verified system, model, and environment telemetry without leaking secrets."""
+    db_health = await check_db_health()
+    return {
+        "app_name": "MEMORA AI",
+        "version": "2.0.0",
+        "environment": settings.ENVIRONMENT,
+        "llm_model": settings.NEBIUS_MODEL,
+        "embedding_model": settings.NEBIUS_EMBEDDING_MODEL,
+        "embedding_dim": settings.EMBEDDING_DIM,
+        "database_provider": "Neon Lakebase Postgres (pgvector)",
+        "database_connected": db_health.get("connected", False),
+        "database_pool_size": db_health.get("pool_size", 0),
+        "database_free_connections": db_health.get("free_connections", 0),
+        "auth_mode": "Strict HMAC Bearer" if settings.ENVIRONMENT.lower() == "production" else "Development / Demo Session",
+        "worker_id": WorkerIdentity.get_worker_id(),
     }
 
 @app.get("/health")
@@ -238,11 +271,12 @@ async def get_memories(
     req: Request,
     session_id: str = Query(default="default-session", description="Session identifier"),
     category: Optional[str] = Query(default=None, description="Optional category filter"),
+    is_active: Optional[bool] = Query(default=True, description="Filter by active status"),
     principal: UserPrincipal = Depends(get_current_principal)
 ):
     valid_sid = validate_session_id(session_id, principal)
     try:
-        memories = await list_memories(session_id=valid_sid, category=category, is_active=True)
+        memories = await list_memories(session_id=valid_sid, category=category, is_active=is_active if is_active is not None else True)
         return MemoryListResponse(
             session_id=valid_sid,
             count=len(memories),
@@ -270,6 +304,33 @@ async def get_single_memory(
         raise
     except Exception as e:
         raise safe_internal_error(e, f"Error fetching memory {memory_id}", req)
+
+@app.patch("/api/memories/{memory_id}", response_model=MemoryRecord)
+async def patch_memory(
+    memory_id: UUID,
+    request: UpdateMemoryRequest,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Update fields on a specific memory record, enforcing session scope."""
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        updated = await update_memory(
+            session_id=valid_sid,
+            memory_id=memory_id,
+            content=request.content,
+            confidence_score=request.confidence_score,
+            category=request.category,
+            is_active=request.is_active
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail="Memory not found or does not belong to this session.")
+        return updated
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, f"Error updating memory {memory_id}", req)
 
 @app.delete("/api/memories/{memory_id}", response_model=DeleteResponse)
 async def remove_memory(
