@@ -1,0 +1,59 @@
+# ==============================================================================
+# MEMORA AI — Render Blueprint Deployment Manifest
+# Deploys Python/FastAPI Backend & React/Vite Frontend
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. FastAPI Backend Web Service
+  # ----------------------------------------------------------------------------
+  - type: web
+    name: memora-ai-backend
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: NEBIUS_API_KEY
+        sync: false
+      - key: NEBIUS_BASE_URL
+        value: https://api.tokenfactory.nebius.com/v1
+      - key: NEBIUS_MODEL
+        value: nvidia/Nemotron-3_5-Lightning
+      - key: NEBIUS_EMBEDDING_MODEL
+        value: Qwen/Qwen3-Embedding-8B
+      - key: EMBEDDING_DIM
+        value: 4096
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: AUTH_SECRET_KEY
+        generateValue: true
+
+  # ----------------------------------------------------------------------------
+  # 2. React + Vite Frontend Static Site
+  # ----------------------------------------------------------------------------
+  - type: web
+    name: memora-ai-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    plan: free
+    region: oregon
+    autoDeploy: true
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_BASE_URL
+        fromService:
+          type: web
+          name: memora-ai-backend
+          property: host
