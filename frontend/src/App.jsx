@@ -294,14 +294,54 @@ function AppContent() {
     await Promise.all([fetchMemories(), fetchDashboardStats(), fetchGraphData()]);
   };
 
-  // Agent Actions
+  // Agent Actions with Serverless Bounded Stepwise Execution
+  const terminalTaskStatuses = [
+    "succeeded",
+    "completed",
+    "failed",
+    "cancelled",
+    "awaiting_approval",
+    "awaiting_clarification",
+    "needs_reconciliation",
+  ];
+
+  const driveTaskExecution = async (initialTask) => {
+    let task = initialTask;
+    while (task && task.status === "running" && !terminalTaskStatuses.includes(task.status)) {
+      try {
+        task = await api.stepAgentTask(sessionId, task.id);
+        setActiveTask(task);
+        await fetchTasks();
+        if (terminalTaskStatuses.includes(task.status)) {
+          break;
+        }
+      } catch (err) {
+        try {
+          const refreshed = await api.getTask(sessionId, task.id);
+          if (refreshed) setActiveTask(refreshed);
+        } catch {
+          // ignore status refresh failure
+        }
+        throw err;
+      }
+    }
+    return task;
+  };
+
   const handleSubmitAgentTask = async (instruction, requireApproval, maxSteps) => {
     setAgentRunning(true);
     try {
-      const task = await api.runAgent(sessionId, instruction, requireApproval, maxSteps);
+      let task = await api.createAgentTask(sessionId, instruction, requireApproval, maxSteps);
       setActiveTask(task);
-      showToast(`Agent plan generated (${task.plan?.steps?.length || 0} steps)`, "success");
+      showToast(`Agent plan initialized (${task.plan?.steps?.length || 0} steps)`, "success");
       await fetchTasks();
+
+      if (task.status === "running") {
+        task = await driveTaskExecution(task);
+      }
+      if (task.status === "succeeded" || task.status === "completed") {
+        showToast("Task completed successfully", "success");
+      }
     } catch (e) {
       showToast(e.message || "Failed to execute agent task", "error");
     } finally {
@@ -310,9 +350,19 @@ function AppContent() {
   };
 
   const handleApproveTask = async (taskId, token, feedback) => {
-    const updated = await api.approveTask(sessionId, taskId, token, feedback);
-    setActiveTask(updated);
-    await fetchTasks();
+    setAgentRunning(true);
+    try {
+      let updated = await api.approveTask(sessionId, taskId, token, feedback);
+      setActiveTask(updated);
+      await fetchTasks();
+      if (updated.status === "running") {
+        await driveTaskExecution(updated);
+      }
+    } catch (e) {
+      showToast(e.message || "Approval execution error", "error");
+    } finally {
+      setAgentRunning(false);
+    }
   };
 
   const handleRejectTask = async (taskId, token, reason) => {
@@ -324,10 +374,13 @@ function AppContent() {
   const handleClarifyTask = async (taskId, clarification) => {
     setAgentRunning(true);
     try {
-      const updated = await api.clarifyTask(sessionId, taskId, clarification);
+      let updated = await api.clarifyTask(sessionId, taskId, clarification);
       setActiveTask(updated);
       showToast("Clarification submitted. Resuming execution.", "success");
       await fetchTasks();
+      if (updated.status === "running") {
+        await driveTaskExecution(updated);
+      }
     } catch (e) {
       showToast(e.message || "Failed to submit clarification", "error");
     } finally {
@@ -342,9 +395,19 @@ function AppContent() {
   };
 
   const handleRetryTask = async (taskId, fromCheckpointId) => {
-    const updated = await api.retryTask(sessionId, taskId, fromCheckpointId);
-    setActiveTask(updated);
-    await fetchTasks();
+    setAgentRunning(true);
+    try {
+      let updated = await api.retryTask(sessionId, taskId, fromCheckpointId);
+      setActiveTask(updated);
+      await fetchTasks();
+      if (updated.status === "running") {
+        await driveTaskExecution(updated);
+      }
+    } catch (e) {
+      showToast(e.message || "Failed to retry task", "error");
+    } finally {
+      setAgentRunning(false);
+    }
   };
 
   const handleFetchCheckpoints = async (taskId) => {

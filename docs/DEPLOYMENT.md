@@ -1,137 +1,154 @@
-# MEMORA AI — Deployment & Infrastructure Guide
+# MEMORA AI — Vercel-Only Deployment & Infrastructure Guide
 
 ## 1. Production Architecture Overview
 
-MEMORA AI utilizes a decoupled, modern two-tier deployment architecture:
+MEMORA AI is deployed exclusively on **Vercel** with a serverless architecture designed for high availability, zero persistent server costs, and global edge distribution:
 
 ```mermaid
 flowchart LR
-    Client([User Browser]) -->|Static Assets & SPA| Vercel[Vercel Static Edge - Frontend]
-    Client -->|REST & SSE API| Render[Render Web Service Docker - Backend]
-    Render -->|PostgreSQL Wire Protocol| Neon[(Neon Serverless PostgreSQL)]
-    Render -->|HTTPS API| Nebius[Nebius TokenFactory LLM]
+    Client([User Browser]) -->|Static Assets & SPA| VercelFE[Vercel Static Edge - Frontend SPA]
+    Client -->|REST & Slices API| VercelBE[Vercel Serverless Functions - Python ASGI]
+    VercelBE -->|Pooled Wire Protocol| Neon[(Neon Serverless PostgreSQL + pgvector)]
+    VercelBE -->|HTTPS API| Nebius[Nebius TokenFactory LLM & Embeddings]
 ```
 
-- **Frontend**: Hosted on **Vercel** as a high-performance static Single Page Application (SPA).
-- **Backend**: Hosted on **Render** as a long-running, persistent Docker Web Service.
+- **Frontend**: Hosted on **Vercel** as a high-performance static Single Page Application (React 19 + Vite 8).
+- **Backend**: Hosted on **Vercel Serverless Functions** (`api/index.py` exporting the FastAPI ASGI application).
 - **Database & Vectors**: Hosted on **Neon Serverless PostgreSQL** with `pgvector` (`vector(1024)`).
-- **Inference**: Hosted on **Nebius TokenFactory** (`Nemotron-3_5-Lightning` and `Qwen3-Embedding-8B`).
+- **Inference**: Hosted on **Nebius TokenFactory** (`nvidia/Nemotron-3_5-Lightning` and `Qwen/Qwen3-Embedding-8B`).
+- **Scheduling**: Automated stale task recovery driven by **Vercel Cron Jobs** (`/api/agent/cron/recover`).
 
 ---
 
-## 2. Platform Evaluation & Hosting Assessment
+## 2. Serverless Architecture & Execution Model
 
-### 2.1 Frontend on Vercel: PASS (Recommended)
-- **Status**: Production-ready.
-- **Mechanism**: Pre-compiled React 19 + Vite 8 static bundle.
-- **Routing**: `frontend/vercel.json` provides an explicit catch-all rewrite rule (`/(.*)` → `/index.html`) to support client-side SPA routing across all 8 workspaces.
-- **Asset Caching**: Vite generates hashed asset filenames (`/assets/*.js`, `/assets/*.css`), allowing aggressive immutable CDN caching on Vercel's global edge network.
+In traditional persistent servers (such as Render or Docker containers), background worker threads run indefinitely. In Vercel serverless functions, execution halts immediately when an HTTP response is delivered.
 
-### 2.2 Backend on Vercel Serverless: NOT RECOMMENDED (Incompatible with Agent Workloads)
-Deploying the FastAPI backend to Vercel Serverless Python functions is strongly discouraged for the following technical reasons:
+To guarantee rock-solid execution without paid external queue services, MEMORA AI implements **Bounded Agent Execution Slices**:
 
-1. **Function Execution Timeouts**:
-   - Vercel serverless functions enforce strict execution limits (10s on Hobby tier, 15s to 300s on Pro).
-   - Multi-step agent DAG execution (involving planning, multiple LLM tool invocations, and reflection) routinely exceeds 10–30 seconds.
-2. **Immediate Execution Freeze**:
-   - Vercel freezes execution context immediately upon delivering an HTTP response.
-   - Background tasks, heartbeat worker leases (`WORKER_LEASE_MINUTES`), and async maintenance loops cannot run.
-3. **Worker Leasing & Fencing Failure**:
-   - The agent architecture relies on active worker heartbeats in PostgreSQL to prevent duplicate execution. Serverless cold starts and context suspension cause spurious lease expirations and split-brain execution states.
-4. **Database Connection Pool Exhaustion**:
-   - Serverless invocations spawn isolated processes, preventing persistent `asyncpg` connection pooling and overwhelming database connection limits.
-
-### 2.3 Backend on Render Web Service: PASS (Recommended)
-- **Status**: Production-ready.
-- **Mechanism**: Containerized via `backend/Dockerfile` with a persistent Uvicorn ASGI server.
-- **Features**: Persistent connection pooling, uninterrupted agent DAG execution, reliable background lease renewal, and continuous health check monitoring.
+1. **Durable State in PostgreSQL**: All agent tasks, plans, and step-level checkpoints are committed to Neon PostgreSQL as the single source of truth.
+2. **Durable Task Creation (`POST /api/agent/tasks`)**: Intent analysis, memory retrieval, plan generation, and policy validation run synchronously. The task and its initial step checkpoints are persisted in PostgreSQL. A durable task ID is returned immediately.
+3. **Bounded Execution Slices (`POST /api/agent/tasks/{task_id}/step`)**: The client or scheduler invokes step execution slices. Each invocation:
+   - Claims an atomic lease with a monotonic fencing generation (`lease_generation`).
+   - Executes ready step(s) within a strict time budget (< 20 seconds, well within Vercel timeout limits).
+   - Checkpoints step results transactionally in Neon PostgreSQL before returning.
+4. **Client-Driven Slicing Loop**: The frontend drives sequential execution slices while the task is active, updating the UI in real time.
+5. **Idempotency & Crash Resilience**: If a slice is interrupted by a network blip or cold start, the next invocation inspects PostgreSQL checkpoints and skips already-completed steps idempotently.
 
 ---
 
-## 3. Deployment Configuration
+## 3. Step-by-Step Vercel Deployment Guide
 
-### 3.1 Render Blueprint (`render.yaml`)
+### 3.1 GitHub Repository Connection
+1. Log into your [Vercel Dashboard](https://vercel.com/dashboard).
+2. Click **Add New...** → **Project**.
+3. Import your GitHub repository: `https://github.com/manojmdev/MEMORA AI` (or your repository fork).
 
-The repository root includes a validated Render Blueprint (`render.yaml`).
+### 3.2 Vercel Project Root Selection
+MEMORA AI supports two deployment configurations:
 
-```yaml
-services:
-  - type: web
-    name: memora-ai-backend
-    runtime: docker
-    dockerfilePath: backend/Dockerfile
-    plan: free
-    region: oregon
-    healthCheckPath: /health
-    autoDeploy: true
-    envVars:
-      - key: ENVIRONMENT
-        value: production
-      - key: DATABASE_URL
-        sync: false
-      - key: NEBIUS_API_KEY
-        sync: false
-      - key: NEBIUS_BASE_URL
-        value: https://api.tokenfactory.nebius.com/v1
-      - key: NEBIUS_MODEL
-        value: nvidia/Nemotron-3_5-Lightning
-      - key: NEBIUS_EMBEDDING_MODEL
-        value: Qwen/Qwen3-Embedding-8B
-      - key: EMBEDDING_DIMENSION
-        value: 1024
-      - key: EMBEDDING_DIM
-        value: 1024
-      - key: FRONTEND_ORIGIN
-        sync: false
-      - key: AUTH_SECRET_KEY
-        generateValue: true
-```
+#### Option A: Unified Full-Stack Project (Recommended)
+- **Root Directory**: Select repository root (`.`).
+- **Framework Preset**: Select `Vite` or `Other`.
+- **Build Command**: `npm --prefix frontend run build` (configured in root `vercel.json`).
+- **Output Directory**: `frontend/dist` (configured in root `vercel.json`).
+- Both the frontend SPA and the Python backend (`api/index.py`) deploy together in a single Vercel project sharing the same domain.
+
+#### Option B: Decoupled Multi-Project
+- **Frontend Project**: Root directory `frontend`. Framework preset `Vite`. Set `VITE_API_BASE_URL` to the backend Vercel project URL.
+- **Backend Project**: Root directory `.`. Deploys the Python serverless function at `/api`.
+
+### 3.3 Backend Environment Variables (Vercel Project Settings)
+In the Vercel Project Settings, navigate to **Settings** → **Environment Variables** and configure:
+
+| Variable | Required | Value / Format | Description |
+|---|---|---|---|
+| `DATABASE_URL` | **Yes** | `postgresql://user:pass@ep-xyz-pooler.region.neon.tech/neondb?sslmode=require` | Neon pooled connection string (PgBouncer `-pooler` endpoint). |
+| `NEBIUS_API_KEY` | **Yes** | `your_nebius_api_key` | Nebius TokenFactory API Key. |
+| `NEBIUS_BASE_URL` | No | `https://api.tokenfactory.nebius.com/v1` | Nebius API endpoint. |
+| `NEBIUS_MODEL` | No | `nvidia/Nemotron-3_5-Lightning` | Primary LLM for chat & planning. |
+| `NEBIUS_EMBEDDING_MODEL`| No | `Qwen/Qwen3-Embedding-8B` | Embedding model name. |
+| `EMBEDDING_DIMENSION` | **Yes** | `1024` | Must match Neon `vector(1024)` column. |
+| `EMBEDDING_DIM` | No | `1024` | Alias for `EMBEDDING_DIMENSION`. |
+| `ENVIRONMENT` | **Yes** | `production` | Production mode lock. |
+| `FRONTEND_ORIGIN` | No | `https://your-project.vercel.app` | Allowed CORS origin (Vercel previews are auto-matched via regex). |
+| `AUTH_SECRET_KEY` | **Yes** | 64-char hex string | HMAC authentication & approval signature secret. |
+| `CRON_SECRET` | Recommended | Random secret string | Authorizes Vercel Cron on `/api/agent/cron/recover`. |
+| `DB_POOL_MIN_SIZE` | No | `1` | Serverless connection pool minimum. |
+| `DB_POOL_MAX_SIZE` | No | `3` | Serverless connection pool maximum. |
+| `ENABLE_BACKGROUND_EMBEDDING_BACKFILL` | No | `false` | Disabled on serverless to prevent dangling background tasks. |
 
 > [!IMPORTANT]
-> **Embedding Dimension Alignment**: The Neon PostgreSQL column `memories.embedding` is strictly `vector(1024)`. Ensure `EMBEDDING_DIMENSION: 1024` and `EMBEDDING_DIM: 1024` are configured. Never use `4096`.
+> **Neon Connection String**: Always use the Neon **Pooled** connection string (containing `-pooler` in the host). This routes connections through Neon's PgBouncer proxy, preventing ephemeral serverless functions from exhausting database connection limits.
 
-### 3.2 Frontend Vercel Configuration (`frontend/vercel.json`)
+### 3.4 Frontend Environment Variables
+| Variable | Required | Value |
+|---|---|---|
+| `VITE_API_BASE_URL` | Conditional | Leave blank or unset for Unified deployment (`/` relative requests). Set to backend URL (e.g. `https://memora-ai-api.vercel.app`) if using decoupled projects. |
 
+> [!WARNING]
+> **No Secrets in Frontend**: Never place `NEBIUS_API_KEY`, `DATABASE_URL`, or `AUTH_SECRET_KEY` in frontend environment variables.
+
+### 3.5 Neon PostgreSQL Connectivity
+- The database schema is fully provisioned in Neon with `pgvector(1024)`.
+- SSL is required (`?sslmode=require`).
+- `asyncpg` manages connections using adaptive connection pooling with connection timeouts.
+
+### 3.6 Nebius TokenFactory Connectivity
+- Validates model availability for `nvidia/Nemotron-3_5-Lightning` and `Qwen/Qwen3-Embedding-8B`.
+- Exponential backoff retry logic is built into all client requests.
+
+### 3.7 CORS Configuration
+- `backend/app/main.py` enforces CORS with origin matching and preview-branch regex:
+  `allow_origin_regex=r"^https:\/\/.*\.vercel\.app$"`
+- All preview and production deployments on `*.vercel.app` are allowed out-of-the-box.
+
+### 3.8 Health Verification
+Verify deployment health:
+```bash
+curl -f https://your-project.vercel.app/health
+```
+Expected response:
 ```json
 {
-  "buildCommand": "npm run build",
-  "outputDirectory": "dist",
-  "rewrites": [
-    {
-      "source": "/(.*)",
-      "destination": "/index.html"
-    }
-  ]
+  "status": "healthy",
+  "database": {
+    "status": "healthy",
+    "connected": true,
+    "provider": "Neon Lakebase Postgres"
+  }
 }
 ```
 
+### 3.9 Agent Task Execution Verification
+Test task initialization and stepwise execution:
+```bash
+# 1. Create a task
+curl -X POST https://your-project.vercel.app/api/agent/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "verify-session", "instruction": "Calculate 50 * 20"}'
+
+# 2. Step the task slice
+curl -X POST "https://your-project.vercel.app/api/agent/tasks/<TASK_ID>/step?session_id=verify-session"
+```
+
+### 3.10 Known Vercel Execution & Scheduling Limitations
+
+> [!CAUTION]
+> **Unattended Execution Limitation**:
+> Because Vercel serverless functions terminate execution when an HTTP response is delivered, agent tasks require either:
+> 1. An active connected client driving execution slices (the default user experience when the browser is open), OR
+> 2. Scheduled Vercel Cron invocations (`GET /api/agent/cron/recover`) to sweep and advance tasks.
+>
+> **If the user closes their browser and disconnects**, the task will safely pause at its latest committed checkpoint in Neon PostgreSQL. It will **not** continue executing in the background unattended until the user returns or a cron trigger fires.
+
 ---
 
-## 4. Step-by-Step Deployment Guide
+## 4. Local Development with Docker
 
-### Step 1: Deploy Backend to Render
-1. Connect your GitHub repository to [Render](https://render.com).
-2. Create a new **Blueprint Instance** pointing to `render.yaml`, or create a **Web Service** using `backend/Dockerfile`.
-3. Fill in secret environment variables in the Render Dashboard:
-   - `DATABASE_URL`: Your pooled Neon connection string (`postgresql://...@ep-pooler...neon.tech/neondb?sslmode=require`).
-   - `NEBIUS_API_KEY`: Your Nebius TokenFactory API key.
-   - `FRONTEND_ORIGIN`: Your production Vercel frontend URL (e.g., `https://memora-ai.vercel.app`).
-   - `AUTH_SECRET_KEY`: A random 32-character hex or UUID string.
-4. Click **Deploy**. Verify the service reports healthy at `https://<your-backend>.onrender.com/health`.
-
-### Step 2: Deploy Frontend to Vercel
-1. Connect your GitHub repository to [Vercel](https://vercel.com).
-2. Set the **Root Directory** to `frontend`.
-3. In Project Settings > Environment Variables, configure:
-   - `VITE_API_BASE_URL`: `https://<your-backend>.onrender.com` (do not add a trailing slash).
-4. Click **Deploy**.
-
----
-
-## 5. Post-Deployment Verification Checklist
-
-- [ ] `GET https://<backend>/health` returns `{"status": "healthy", "database": "connected"}`.
-- [ ] `GET https://<backend>/api/system/info` returns sanitized environment status without leaking secrets.
-- [ ] Send a message in the Chat Workspace and verify memory persistence in the Memory Explorer.
-- [ ] Create an agent goal in the Agent Workspace and verify step execution and approval gates.
-- [ ] Inspect browser console to confirm zero CORS errors between Vercel and Render.
+The containerized Docker development environment is preserved for local development:
+```bash
+docker build -t memora-backend -f backend/Dockerfile .
+docker run -p 8000:8000 --env-file backend/.env memora-backend
+```
+Render deployment configuration (`render.yaml`) is maintained in the repository for historical continuity.

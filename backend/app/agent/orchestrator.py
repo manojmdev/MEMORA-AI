@@ -72,19 +72,20 @@ class AgentOrchestrator:
             max_steps=max_steps
         )
 
-    async def run_task(
+    async def create_task(
         self,
         session_id: str = "default-session",
         user_request: str = "",
         message: Optional[str] = None,
         require_approval: Optional[bool] = None,
         max_steps: int = 6
-    ) -> AgentTaskResponse:
+    ) -> Tuple[AgentTaskResponse, Optional[List[Any]]]:
         """
-        Execute an agent task:
+        Durable task initialization:
         1. Retrieve relevant memories and analyze intent concurrently.
         2. Plan and validate execution steps.
-        3. Execute automatic steps or pause for user approval on persistent writes.
+        3. Persist task and initial checkpoints transactionally in Neon PostgreSQL.
+        4. Return initial task state without executing steps.
         """
         req = user_request or message or ""
         clean_session = session_id.strip() if session_id else "default-session"
@@ -138,7 +139,7 @@ class AgentOrchestrator:
                 memories_used=[],
                 tools_executed=[],
                 execution_timeline=[]
-            )
+            ), recalled_memories
 
         # 3. Generate plan
         proposed_plan = await generate_plan(
@@ -171,7 +172,7 @@ class AgentOrchestrator:
                 memories_used=[m.model_dump(mode="json") for m in recalled_memories],
                 tools_executed=[],
                 execution_timeline=[]
-            )
+            ), recalled_memories
 
         # 4. Validate plan authoritatively
         is_valid, plan, validation_error = validate_plan(proposed_plan, require_approval=effective_require_approval)
@@ -196,7 +197,7 @@ class AgentOrchestrator:
                 memories_used=[m.model_dump(mode="json") for m in recalled_memories],
                 tools_executed=[],
                 execution_timeline=[]
-            )
+            ), recalled_memories
 
         # 5. Persist valid task
         task = AgentTask(
@@ -211,9 +212,42 @@ class AgentOrchestrator:
         )
         await self._persist_new_task(task)
         await checkpoint_manager.init_task_checkpoints(task.id, task.session_id, plan)
+        checkpoints = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+        task.checkpoints = checkpoints
 
-        # 6. Execute plan steps
-        return await self._execute_plan_steps(task, recalled_memories)
+        reply = f"Task plan created with {len(plan.steps)} steps. Initialized for execution."
+        return AgentTaskResponse(
+            task=task,
+            reply=reply,
+            memories_used=[m.model_dump(mode="json") for m in recalled_memories],
+            tools_executed=[],
+            execution_timeline=[],
+            checkpoints=checkpoints
+        ), recalled_memories
+
+    async def run_task(
+        self,
+        session_id: str = "default-session",
+        user_request: str = "",
+        message: Optional[str] = None,
+        require_approval: Optional[bool] = None,
+        max_steps: int = 6
+    ) -> AgentTaskResponse:
+        """
+        Execute an agent task:
+        1. Initialize and plan task in PostgreSQL.
+        2. Execute plan steps within bounded execution budget.
+        """
+        init_resp, recalled_memories = await self.create_task(
+            session_id=session_id,
+            user_request=user_request,
+            message=message,
+            require_approval=require_approval,
+            max_steps=max_steps
+        )
+        if init_resp.task and init_resp.task.status == TaskStatus.RUNNING:
+            return await self._execute_plan_steps(init_resp.task, recalled_memories)
+        return init_resp
 
     def _safe_compose_response(
         self,
@@ -670,7 +704,14 @@ class AgentOrchestrator:
                         "cached_checkpoint": True
                     })
 
+            start_loop_time = asyncio.get_event_loop().time()
+            slice_budget_seconds = float(getattr(settings, "MAX_TASK_EXECUTION_BUDGET_SECONDS", 120.0))
+
             while True:
+                if (asyncio.get_event_loop().time() - start_loop_time) >= slice_budget_seconds:
+                    logger.info(f"Task {task.id} execution reached slice time budget ({slice_budget_seconds}s). Halting bounded slice.")
+                    break
+
                 if task.status == TaskStatus.CANCEL_REQUESTED:
                     task.status = TaskStatus.CANCELLED
                     task.completed_at = datetime.now(timezone.utc)
@@ -898,6 +939,323 @@ class AgentOrchestrator:
         return await self._execute_plan_steps(task)
 
     approve_and_resume = approve_task
+
+    async def execute_task_slice(
+        self,
+        session_id: str,
+        task_id: UUID,
+        worker_id: Optional[str] = None,
+        max_duration_seconds: float = 20.0,
+        max_steps: int = 1
+    ) -> AgentTaskResponse:
+        """
+        Execute a single bounded slice of an agent task in a serverless environment.
+        1. Validates task existence, ownership, and non-terminal status.
+        2. Claims worker lease with monotonic fencing token.
+        3. Identifies next ready steps in DAG order.
+        4. Executes ready step(s) with checkpointing and error handling.
+        5. Updates task status and returns immediately.
+        """
+        clean_session = session_id.strip() if session_id else "default-session"
+        if isinstance(task_id, str):
+            task_id = UUID(task_id)
+
+        task = await self.get_task(clean_session, task_id)
+        if not task:
+            raise ValueError(f"Task '{task_id}' not found for session '{clean_session}'.")
+
+        checkpoints = await checkpoint_manager.get_task_checkpoints(task_id, clean_session)
+        task.checkpoints = checkpoints
+
+        # 1. Guard terminal states - cannot be reopened
+        if task.status in (TaskStatus.SUCCEEDED, TaskStatus.COMPLETED):
+            return AgentTaskResponse(
+                task=task,
+                reply=f"Task is already {task.status.value}.",
+                checkpoints=checkpoints
+            )
+        if task.status == TaskStatus.CANCELLED:
+            return AgentTaskResponse(
+                task=task,
+                reply="Task is cancelled.",
+                checkpoints=checkpoints
+            )
+        if task.status == TaskStatus.FAILED:
+            return AgentTaskResponse(
+                task=task,
+                reply=task.result_summary or "Task execution failed.",
+                checkpoints=checkpoints
+            )
+        if task.status == TaskStatus.AWAITING_APPROVAL:
+            return AgentTaskResponse(
+                task=task,
+                reply="Task is awaiting explicit user approval. Grant approval with signed token to proceed.",
+                checkpoints=checkpoints
+            )
+        if task.status == TaskStatus.AWAITING_CLARIFICATION:
+            return AgentTaskResponse(
+                task=task,
+                reply=task.clarification_prompt or "Task requires user clarification.",
+                checkpoints=checkpoints
+            )
+        if task.status == TaskStatus.NEEDS_RECONCILIATION:
+            return AgentTaskResponse(
+                task=task,
+                reply=task.result_summary or "Task requires manual reconciliation before continuation.",
+                checkpoints=checkpoints
+            )
+
+        if not task.plan or not task.plan.steps:
+            task.status = TaskStatus.FAILED
+            task.result_summary = "Task has no executable plan."
+            task.completed_at = datetime.now(timezone.utc)
+            await self._update_task_record(task)
+            return AgentTaskResponse(task=task, reply="No valid plan found for task.", checkpoints=checkpoints)
+
+        # 2. Claim execution lease with fencing generation
+        eff_worker_id = worker_id or WorkerIdentity.get_worker_id()
+        lease_seconds = getattr(settings, "WORKER_LEASE_SECONDS", 60)
+        claimed, lease_generation, claim_err = await self.claim_task_lease(
+            task.id, task.session_id, worker_id=eff_worker_id, lease_seconds=lease_seconds
+        )
+        if not claimed:
+            logger.warning(f"Cannot execute task slice for {task.id}: {claim_err}")
+            raise StaleWorkerError(f"Cannot execute task slice: {claim_err}")
+
+        task.worker_id = eff_worker_id
+        task.lease_generation = lease_generation
+        task.status = TaskStatus.RUNNING
+
+        # 3. Track active task for cancellation
+        current_async_task = asyncio.current_task()
+        if current_async_task:
+            self._active_tasks[task.id] = current_async_task
+
+        try:
+            tools_executed = []
+            timeline = []
+
+            # Sync plan steps with existing checkpoints
+            succeeded_step_ids = {
+                cp.step_id for cp in checkpoints
+                if cp.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED)
+            }
+            for step in task.plan.steps:
+                matching_cp = next((c for c in checkpoints if c.step_id == step.step_id), None)
+                if matching_cp and matching_cp.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED):
+                    step.status = StepStatus.SUCCEEDED
+                    if matching_cp.result is not None:
+                        step.result = matching_cp.result
+                    succeeded_step_ids.add(step.step_id)
+
+            # Check if cancellation requested
+            if task.status == TaskStatus.CANCEL_REQUESTED:
+                task.status = TaskStatus.CANCELLED
+                task.completed_at = datetime.now(timezone.utc)
+                task.result_summary = "Task was cancelled by user."
+                await checkpoint_manager.cancel_pending_checkpoints(task.id, task.session_id)
+                await self._update_task_record(task, worker_id=eff_worker_id, lease_generation=lease_generation)
+                fresh_cp = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+                task.checkpoints = fresh_cp
+                return AgentTaskResponse(task=task, reply="Task was cancelled by user.", checkpoints=fresh_cp)
+
+            # Mark skipped steps whose prerequisites failed or were cancelled
+            failed_or_skipped_ids = {
+                s.step_id for s in task.plan.steps
+                if s.status in (StepStatus.FAILED, StepStatus.SKIPPED, StepStatus.CANCELLED, StepStatus.NEEDS_RECONCILIATION)
+            }
+            for s in task.plan.steps:
+                if s.status in (StepStatus.PENDING, StepStatus.READY):
+                    if any(dep in failed_or_skipped_ids for dep in s.dependencies):
+                        s.status = StepStatus.SKIPPED
+                        s.error = "Skipped due to failure or cancellation of prerequisite step."
+                        await checkpoint_manager.update_checkpoint(
+                            task_id=task.id,
+                            session_id=task.session_id,
+                            step_id=s.step_id,
+                            status=StepStatus.SKIPPED,
+                            error_message=s.error,
+                            worker_id=eff_worker_id,
+                            lease_generation=lease_generation,
+                            completed=True
+                        )
+                        timeline.append({"step_id": s.step_id, "status": "skipped"})
+                        failed_or_skipped_ids.add(s.step_id)
+
+            # Find ready steps
+            ready_steps = [
+                s for s in task.plan.steps
+                if s.status in (StepStatus.PENDING, StepStatus.READY)
+                and all(dep in succeeded_step_ids for dep in s.dependencies)
+            ]
+
+            if not ready_steps:
+                # No more reachable steps; determine final state
+                all_done = all(s.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED) for s in task.plan.steps)
+                if all_done:
+                    task.status = TaskStatus.SUCCEEDED
+                    task.completed_at = datetime.now(timezone.utc)
+                    task.result_summary = f"All {len(task.plan.steps)} plan steps executed successfully."
+                elif any(s.status == StepStatus.NEEDS_RECONCILIATION for s in task.plan.steps):
+                    task.status = TaskStatus.NEEDS_RECONCILIATION
+                elif any(s.status == StepStatus.FAILED for s in task.plan.steps):
+                    task.status = TaskStatus.FAILED
+                    task.completed_at = datetime.now(timezone.utc)
+                await self._update_task_record(task, worker_id=eff_worker_id, lease_generation=lease_generation)
+                fresh_cp = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+                task.checkpoints = fresh_cp
+                reply = self._safe_compose_response(task)
+                return AgentTaskResponse(
+                    task=task,
+                    reply=reply,
+                    checkpoints=fresh_cp,
+                    execution_timeline=timeline
+                )
+
+            # Approval check on the first ready step
+            approval_steps = [s for s in ready_steps if s.permission == ToolPermission.APPROVAL_REQUIRED]
+            automatic_steps = [s for s in ready_steps if s.permission != ToolPermission.APPROVAL_REQUIRED]
+
+            if approval_steps and not automatic_steps:
+                step_to_approve = approval_steps[0]
+                ok, early_resp = await self._execute_single_step(
+                    task=task,
+                    step=step_to_approve,
+                    worker_id=eff_worker_id,
+                    lease_generation=lease_generation,
+                    lease_seconds=lease_seconds,
+                    existing_checkpoints=checkpoints,
+                    tools_executed=tools_executed,
+                    timeline=timeline
+                )
+                if early_resp:
+                    return early_resp
+
+            steps_to_run = automatic_steps if automatic_steps else [approval_steps[0]]
+            steps_in_slice = steps_to_run[:max_steps]
+
+            if len(steps_in_slice) == 1:
+                try:
+                    ok, early_resp = await asyncio.wait_for(
+                        self._execute_single_step(
+                            task=task,
+                            step=steps_in_slice[0],
+                            worker_id=eff_worker_id,
+                            lease_generation=lease_generation,
+                            lease_seconds=lease_seconds,
+                            existing_checkpoints=checkpoints,
+                            tools_executed=tools_executed,
+                            timeline=timeline
+                        ),
+                        timeout=max_duration_seconds
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Task {task.id} step {steps_in_slice[0].step_id} timed out after {max_duration_seconds}s")
+                    steps_in_slice[0].status = StepStatus.FAILED
+                    steps_in_slice[0].error = f"Step execution timed out after {max_duration_seconds}s."
+                    await checkpoint_manager.update_checkpoint(
+                        task_id=task.id,
+                        session_id=task.session_id,
+                        step_id=steps_in_slice[0].step_id,
+                        status=StepStatus.FAILED,
+                        error_message=steps_in_slice[0].error,
+                        worker_id=eff_worker_id,
+                        lease_generation=lease_generation,
+                        completed=True
+                    )
+                    task.status = TaskStatus.FAILED
+                    task.completed_at = datetime.now(timezone.utc)
+                    task.result_summary = f"Execution timed out at step {steps_in_slice[0].step_id} after {max_duration_seconds}s."
+                    await self._update_task_record(task, worker_id=eff_worker_id, lease_generation=lease_generation)
+                    fresh_cp = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+                    task.checkpoints = fresh_cp
+                    return AgentTaskResponse(
+                        task=task,
+                        reply=f"Step execution timed out after {max_duration_seconds}s. All prior checkpoints are safely preserved. You may retry this task.",
+                        checkpoints=fresh_cp
+                    )
+
+                if early_resp:
+                    return early_resp
+                if ok:
+                    succeeded_step_ids.add(steps_in_slice[0].step_id)
+                else:
+                    task.status = TaskStatus.FAILED
+                    task.completed_at = datetime.now(timezone.utc)
+                    task.result_summary = f"Execution failed at {steps_in_slice[0].step_id}: {steps_in_slice[0].error or 'Unknown error'}"
+            else:
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*[
+                            self._execute_single_step(
+                                task=task,
+                                step=st,
+                                worker_id=eff_worker_id,
+                                lease_generation=lease_generation,
+                                lease_seconds=lease_seconds,
+                                existing_checkpoints=checkpoints,
+                                tools_executed=tools_executed,
+                                timeline=timeline
+                            )
+                            for st in steps_in_slice
+                        ]),
+                        timeout=max_duration_seconds
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Task {task.id} batch slice timed out after {max_duration_seconds}s")
+                    task.status = TaskStatus.FAILED
+                    task.completed_at = datetime.now(timezone.utc)
+                    task.result_summary = f"Batch slice timed out after {max_duration_seconds}s."
+                    await self._update_task_record(task, worker_id=eff_worker_id, lease_generation=lease_generation)
+                    fresh_cp = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+                    task.checkpoints = fresh_cp
+                    return AgentTaskResponse(
+                        task=task,
+                        reply=f"Batch execution timed out after {max_duration_seconds}s. You may retry this task.",
+                        checkpoints=fresh_cp
+                    )
+
+                batch_failed = False
+                for (ok, early_resp), st in zip(results, steps_in_slice):
+                    if early_resp:
+                        return early_resp
+                    if ok:
+                        succeeded_step_ids.add(st.step_id)
+                    else:
+                        batch_failed = True
+                if batch_failed:
+                    task.status = TaskStatus.FAILED
+                    task.completed_at = datetime.now(timezone.utc)
+                    task.result_summary = "One or more steps failed during slice execution."
+
+            # Final status check for this slice
+            all_done = all(s.status in (StepStatus.SUCCEEDED, StepStatus.COMPLETED) for s in task.plan.steps)
+            if all_done:
+                task.status = TaskStatus.SUCCEEDED
+                task.completed_at = datetime.now(timezone.utc)
+                task.result_summary = f"All {len(task.plan.steps)} plan steps executed successfully."
+            elif any(s.status == StepStatus.NEEDS_RECONCILIATION for s in task.plan.steps):
+                task.status = TaskStatus.NEEDS_RECONCILIATION
+            elif any(s.status == StepStatus.AWAITING_APPROVAL for s in task.plan.steps):
+                task.status = TaskStatus.AWAITING_APPROVAL
+            elif any(s.status == StepStatus.FAILED for s in task.plan.steps):
+                task.status = TaskStatus.FAILED
+            else:
+                task.status = TaskStatus.RUNNING
+
+            await self._update_task_record(task, worker_id=eff_worker_id, lease_generation=lease_generation)
+            fresh_cp = await checkpoint_manager.get_task_checkpoints(task.id, task.session_id)
+            task.checkpoints = fresh_cp
+            reply = self._safe_compose_response(task)
+            return AgentTaskResponse(
+                task=task,
+                reply=reply,
+                tools_executed=tools_executed,
+                execution_timeline=timeline,
+                checkpoints=fresh_cp
+            )
+        finally:
+            self._active_tasks.pop(task.id, None)
 
     async def reject_task(
         self,

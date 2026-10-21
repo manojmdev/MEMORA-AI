@@ -6,8 +6,8 @@
 
 ```mermaid
 flowchart TD
-    User([User / Browser]) <-->|HTTPS / JSON API| FE[React 19 + Vite Frontend SPA]
-    FE <-->|FastAPI Async REST| BE[FastAPI Backend Application]
+    User([User / Browser]) <-->|HTTPS / JSON API| FE[React 19 + Vite Frontend SPA on Vercel]
+    FE <-->|FastAPI Async REST| BE[FastAPI on Vercel Python Serverless Functions]
 
     subgraph Storage & Vector Engine
         DB[(Neon Serverless PostgreSQL)]
@@ -22,13 +22,14 @@ flowchart TD
         EMB[Qwen3-Embedding-8B 1024-dim]
     end
 
-    subgraph Agent Execution Engine
+    subgraph Serverless Agent Engine
         ORCH[Agent Orchestrator]
         PLAN[Planner & Intent Analyzer]
         VAL[Plan Validator]
         POL[Policy & Approval Manager]
         CHK[Durable Checkpoint Manager]
-        FENCE[Worker Fencing & Leases]
+        FENCE[Worker Fencing & Monotonic Leases]
+        SLICE[Bounded Execution Slices]
     end
 
     subgraph Memory Engine
@@ -49,6 +50,7 @@ flowchart TD
     ORCH --> POL
     ORCH --> CHK
     ORCH --> FENCE
+    ORCH --> SLICE
 
     EXTRACT --> LLM
     HYBRID --> EMB
@@ -124,11 +126,25 @@ Certain high-impact tools (e.g., `create_note`, external mutations) require expl
 - Resumption requires submitting the exact token and step ID.
 - Tokens are one-time-use; replay attempts are rejected.
 
-### 4.4 Worker Fencing & Crash Resilience
-- **Worker Leases**: Executing workers hold a leased lock (`worker_id`, `lease_expires_at`) in PostgreSQL.
-- **Heartbeat Verification**: Workers must renew leases every `WORKER_LEASE_MINUTES`.
-- **Fencing Protection**: If a worker crashes or stalls, competing workers detect expired leases, preempt the stale worker, and resume execution from the last durable checkpoint.
+### 4.4 Serverless Bounded Execution Slices & Durable Checkpointing
+In the Vercel-only architecture, persistent background worker loops are replaced with durable, request-driven execution slices:
+1. **Durable Task Creation (`POST /api/agent/tasks`)**: Intent analysis, memory grounding, planning, and policy validation run synchronously. The task is persisted in Neon PostgreSQL (`agent_tasks`) with step-level checkpoints (`agent_task_checkpoints`) in `PENDING` or `READY` state. A durable task ID is returned immediately.
+2. **Step Execution Slices (`POST /api/agent/tasks/{task_id}/step`)**: The client or scheduler invokes bounded execution slices. Each invocation:
+   - Claims an atomic lease with a monotonic fencing generation (`lease_generation`).
+   - Identifies the next topological wave or step with satisfied prerequisites.
+   - Executes the bounded work within a strict execution budget (< 20 seconds, safely below Vercel timeouts).
+   - Checkpoints step results transactionally in PostgreSQL before returning.
+3. **Client-Driven Stepping Loop**: The React frontend drives sequential execution slices while the task is `RUNNING`, providing live UI progress without holding long-lived HTTP connections open.
+4. **Execution Resumption & Idempotency**: If a slice or network connection is interrupted, the next invocation inspects PostgreSQL checkpoints. Already-completed steps are skipped idempotently using their cached results.
+
+### 4.5 Worker Fencing & Crash Resilience
+- **Worker Leases**: Executing workers hold a leased lock (`worker_id`, `execution_lease_expires_at`, `lease_generation`) in PostgreSQL.
+- **Monotonic Fencing**: Competing or stale invocations with an outdated `lease_generation` are rejected with `StaleWorkerError`.
+- **Stale Task Recovery**: Tasks with expired leases are recovered via `recover_interrupted_tasks()`, callable via `POST /api/agent/recovery` or automated Vercel Cron (`GET /api/agent/cron/recover`).
 - **Immutable Audit Trail**: All step transitions are recorded in `agent_execution_logs`. PostgreSQL triggers block raw `UPDATE` or `DELETE` operations on audit tables.
+
+> [!IMPORTANT]
+> **Serverless Unattended Execution Limitation**: Because Vercel serverless functions terminate execution when an HTTP response is delivered, agent tasks require either an active connected client driving execution slices or scheduled Vercel Cron invocations. Unattended background task execution after the browser disconnects does not proceed autonomously without an active caller or cron trigger.
 
 ---
 

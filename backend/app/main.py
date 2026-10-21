@@ -118,12 +118,13 @@ async def lifespan(app: FastAPI):
     logger.info("Starting MEMORA AI API with Semantic & Hybrid Memory Retrieval Engine...")
     try:
         await init_db_pool()
-        # Day 7: Recover tasks interrupted by a prior unexpected server restart
+        # Recover tasks interrupted by a prior unexpected server restart
         await recover_interrupted_tasks()
-        # Day 7: Track background embedding backfill task for graceful drain on shutdown
-        backfill_task = asyncio.create_task(backfill_missing_embeddings())
-        _managed_tasks.add(backfill_task)
-        backfill_task.add_done_callback(_managed_tasks.discard)
+        # Track background embedding backfill task if explicitly enabled (disabled by default on serverless)
+        if settings.ENABLE_BACKGROUND_EMBEDDING_BACKFILL:
+            backfill_task = asyncio.create_task(backfill_missing_embeddings())
+            _managed_tasks.add(backfill_task)
+            backfill_task.add_done_callback(_managed_tasks.discard)
     except Exception as e:
         logger.error(f"Database pool initialization warning: {e}")
     yield
@@ -372,6 +373,90 @@ async def run_evaluation_benchmark(req: Request):
 # ============================================================================
 # DAY 6 — AGENTIC MEMORY & CONTROLLED EXECUTION ENDPOINTS
 # ============================================================================
+
+@app.post("/api/agent/tasks", response_model=AgentTaskResponse)
+async def create_agent_task(
+    request: AgentRunRequest,
+    req: Request,
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """
+    Initialize and persist an agent task and its plan in PostgreSQL.
+    Returns durable task ID and plan without executing long-running steps.
+    """
+    valid_sid = validate_session_id(request.session_id, principal)
+    try:
+        resp, _ = await agent_orchestrator.create_task(
+            session_id=valid_sid,
+            user_request=request.effective_instruction,
+            require_approval=request.require_approval,
+            max_steps=request.max_steps
+        )
+        return resp
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Agent task creation error", req)
+
+@app.post("/api/agent/tasks/{task_id}/step", response_model=AgentTaskResponse)
+async def step_agent_task(
+    task_id: UUID,
+    req: Request,
+    session_id: str = Query(default="default-session", description="Session identifier"),
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """
+    Execute a bounded execution slice of an agent task in a serverless environment.
+    Claims database lease with fencing generation, runs ready step(s), updates checkpoints,
+    and returns current state.
+    """
+    valid_sid = validate_session_id(session_id, principal)
+    try:
+        return await agent_orchestrator.execute_task_slice(
+            session_id=valid_sid,
+            task_id=task_id,
+            max_duration_seconds=20.0,
+            max_steps=1
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Agent task step execution failed", req)
+
+@app.post("/api/agent/recovery")
+async def recover_tasks_endpoint(
+    req: Request,
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """Manually trigger stale interrupted task recovery for the system."""
+    try:
+        count = await recover_interrupted_tasks()
+        return {"status": "ok", "recovered_count": count}
+    except Exception as e:
+        raise safe_internal_error(e, "Task recovery sweep failed", req)
+
+@app.get("/api/agent/cron/recover")
+async def cron_recover_tasks(req: Request):
+    """
+    Vercel Cron endpoint to recover stale tasks with expired worker leases.
+    Authorized via CRON_SECRET header in production environment.
+    """
+    auth_header = req.headers.get("Authorization")
+    if settings.ENVIRONMENT.lower() == "production":
+        if not settings.CRON_SECRET:
+            raise HTTPException(status_code=500, detail="CRON_SECRET is not configured in production.")
+        expected = f"Bearer {settings.CRON_SECRET}"
+        if auth_header != expected:
+            raise HTTPException(status_code=401, detail="Unauthorized cron invocation.")
+    try:
+        count = await recover_interrupted_tasks()
+        return {"status": "ok", "recovered_count": count}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Cron recovery sweep failed", req)
 
 @app.post("/api/agent/run", response_model=AgentTaskResponse)
 async def run_agent_task(

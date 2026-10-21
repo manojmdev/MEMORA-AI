@@ -27,6 +27,7 @@ A unified test runner `backend/run_all_tests.py` orchestrates test discovery, en
 | 13 | `test_sprint4_5_agent_e2e.py` | Sprint 4.5 | `db` | Multi-workspace agent workflows, parallel waves, cryptographic approvals |
 | 14 | `test_chat_regression_suite.py` | Sprint 4 | `db` | 10 deterministic chat scenarios: context grounding, identity, safety |
 | 15 | `test_live_chat_verification.py` | Sprint 4 | `live` | Live end-to-end conversation, real-time memory extraction and recall |
+| 16 | `test_serverless_slices.py` | Sprint 5 | `live` | Bounded execution slices, checkpoint resumption, worker lease fencing, Vercel ASGI entrypoint |
 
 ---
 

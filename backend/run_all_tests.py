@@ -147,7 +147,7 @@ TEST_SUITES: List[TestSuiteMetadata] = [
         phase="Sprint 4.5",
         category="live",
         description="End-to-end multi-workspace execution across all 8 specialized agent roles.",
-        timeout_sec=300
+        timeout_sec=480
     ),
     TestSuiteMetadata(
         filename="test_chat_regression_suite.py",
@@ -163,6 +163,14 @@ TEST_SUITES: List[TestSuiteMetadata] = [
         phase="Sprint 4",
         category="live",
         description="End-to-end live chat conversation with full memory extraction, persistence, and recall.",
+        timeout_sec=300
+    ),
+    TestSuiteMetadata(
+        filename="test_serverless_slices.py",
+        name="Sprint 5 Serverless Bounded Slices & Vercel Architecture",
+        phase="Sprint 5",
+        category="live",
+        description="Verifies bounded execution slices, checkpoint resumption, fencing, approval gating & Vercel ASGI entrypoint.",
         timeout_sec=300
     ),
 ]

@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     AUTH_SECRET_KEY: Optional[str] = None
     API_AUTH_TOKENS: Optional[str] = None  # Format: "token:user_id:session_id,..."
     WORKER_LEASE_MINUTES: int = 5
+    WORKER_LEASE_SECONDS: int = 60
+    CRON_SECRET: Optional[str] = None
+
+    # Serverless & Connection Pool Configuration
+    DB_POOL_MIN_SIZE: int = 1
+    DB_POOL_MAX_SIZE: int = 3
+    DB_COMMAND_TIMEOUT: float = 30.0
+    ENABLE_BACKGROUND_EMBEDDING_BACKFILL: bool = False
+    SKIP_SCHEMA_MIGRATIONS: bool = False
 
     model_config = SettingsConfigDict(
         env_file=(str(ENV_FILE), ".env", str(Path(__file__).resolve().parent.parent.parent / ".env.local")),

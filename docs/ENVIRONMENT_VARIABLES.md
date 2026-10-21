@@ -28,6 +28,13 @@ This document provides a comprehensive, production-audited catalog of all enviro
 | `AUTH_SECRET_KEY` | string | Recommended| `None` | **Secret** | 32+ character random secret used for HMAC-SHA256 signature generation and approval tokens. |
 | `API_AUTH_TOKENS` | string | No | `None` | **Secret** | Static pre-shared token map format: `"token:user_id:session_id,..."`. |
 | `WORKER_LEASE_MINUTES` | integer | No | `5` | Public | Duration in minutes of distributed agent worker lease before being marked stale and reclaimable. |
+| `WORKER_LEASE_SECONDS` | integer | No | `60` | Public | Duration in seconds of bounded serverless execution slice lease claim. |
+| `CRON_SECRET` | string | No | `None` | **Secret** | Bearer secret for authenticating Vercel Cron invocations (`/api/agent/cron/recover`). |
+| `DB_POOL_MIN_SIZE` | integer | No | `1` | Public | Minimum connections in serverless connection pool. |
+| `DB_POOL_MAX_SIZE` | integer | No | `3` | Public | Maximum connections in serverless connection pool (tuned for Neon serverless concurrency). |
+| `DB_COMMAND_TIMEOUT` | float | No | `30.0` | Public | Query timeout in seconds for PostgreSQL operations. |
+| `ENABLE_BACKGROUND_EMBEDDING_BACKFILL` | boolean | No | `false` | Public | Controls whether embedding backfill task runs in background. Default `false` on serverless. |
+| `SKIP_SCHEMA_MIGRATIONS` | boolean | No | `false` | Public | When `true`, skips executing DDL schema verification on cold start for maximum throughput. |
 
 ---
 

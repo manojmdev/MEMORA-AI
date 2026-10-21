@@ -6,8 +6,9 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Global connection pool instance
+# Global connection pool instance and schema state
 _pool: Optional[asyncpg.Pool] = None
+_schema_initialized: bool = False
 
 CREATE_MEMORIES_TABLE_SQL = f"""
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -248,9 +249,9 @@ def get_clean_dsn(raw_url: str) -> str:
     return urllib.parse.urlunparse(parsed._replace(query=""))
 
 async def init_db_pool() -> Optional[asyncpg.Pool]:
-    """Initialize the asynchronous PostgreSQL connection pool."""
+    """Initialize the asynchronous PostgreSQL connection pool with serverless-safe sizing."""
     global _pool
-    if _pool is not None:
+    if _pool is not None and not _pool._closed:
         return _pool
 
     if not settings.DATABASE_URL:
@@ -258,49 +259,70 @@ async def init_db_pool() -> Optional[asyncpg.Pool]:
         return None
 
     clean_dsn = get_clean_dsn(settings.DATABASE_URL)
-    logger.info("Initializing Neon PostgreSQL connection pool (SSL required)...")
+    min_size = max(1, settings.DB_POOL_MIN_SIZE)
+    max_size = max(min_size, settings.DB_POOL_MAX_SIZE)
+    cmd_timeout = max(5.0, settings.DB_COMMAND_TIMEOUT)
+    logger.info(f"Initializing Neon PostgreSQL connection pool (SSL required, min={min_size}, max={max_size}, timeout={cmd_timeout}s)...")
 
     try:
         _pool = await asyncpg.create_pool(
             clean_dsn,
             ssl="require",
-            min_size=1,
-            max_size=10,
-            command_timeout=30.0,
+            min_size=min_size,
+            max_size=max_size,
+            command_timeout=cmd_timeout,
         )
         logger.info("Neon PostgreSQL connection pool created successfully.")
         
-        # Initialize schema
-        await init_db_schema()
+        # Initialize schema if not explicitly skipped
+        if not settings.SKIP_SCHEMA_MIGRATIONS:
+            await init_db_schema()
         return _pool
     except Exception as e:
         logger.error(f"Failed to create Neon PostgreSQL connection pool: {e}")
         raise
 
 async def init_db_schema() -> None:
-    """Ensure required database schema and tables exist."""
+    """
+    Ensure required database schema and tables exist.
+    Uses a PostgreSQL transaction-level advisory lock (pg_advisory_xact_lock) to ensure
+    safe distributed concurrency across multiple serverless cold-starts, while releasing
+    the lock automatically at transaction end for PgBouncer/Neon compatibility.
+    """
+    global _schema_initialized
+    if _schema_initialized:
+        return
+
     pool = await get_db_pool()
     if pool is None:
         return
 
+    # Unique 64-bit advisory lock key for MEMORA AI schema initialization
+    MIGRATION_ADVISORY_LOCK_ID = 84729104
+
     async with pool.acquire() as conn:
-        logger.info("Executing initial schema migrations (memories table)...")
-        await conn.execute(CREATE_MEMORIES_TABLE_SQL)
-        logger.info("Schema migrations applied successfully.")
+        logger.info("Acquiring distributed PostgreSQL advisory lock for schema initialization...")
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1);", MIGRATION_ADVISORY_LOCK_ID)
+            logger.info("Executing initial schema migrations with distributed lock held...")
+            await conn.execute(CREATE_MEMORIES_TABLE_SQL)
+        _schema_initialized = True
+        logger.info("Schema migrations applied and distributed lock released.")
 
 async def close_db_pool() -> None:
     """Gracefully close the PostgreSQL connection pool."""
-    global _pool
+    global _pool, _schema_initialized
     if _pool is not None:
         logger.info("Closing Neon PostgreSQL connection pool...")
         await _pool.close()
         _pool = None
+        _schema_initialized = False
         logger.info("Neon PostgreSQL connection pool closed.")
 
 async def get_db_pool() -> Optional[asyncpg.Pool]:
-    """Get the active connection pool, initializing it if needed."""
+    """Get the active connection pool, initializing or reconnecting it if needed."""
     global _pool
-    if _pool is None and settings.DATABASE_URL:
+    if (_pool is None or _pool._closed) and settings.DATABASE_URL:
         await init_db_pool()
     return _pool
 

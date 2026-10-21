@@ -18,10 +18,11 @@ MEMORA AI is an enterprise-grade personal AI assistant combining self-evolving l
 
 ### 🤖 Resilient Agent Subsystem
 - **Goal-Backward DAG Planning**: Natural language objectives are decomposed into strictly sequenced, dependency-aware execution steps.
+- **Serverless Bounded Execution Slices**: Executes durable step-by-step slices (`POST /api/agent/tasks/{task_id}/step`), preventing function timeouts and ensuring sub-second UI responsiveness.
 - **Wave-Based Concurrency**: Independent steps execute concurrently in parallel waves (`asyncio.gather`), maximizing throughput.
 - **Cryptographic Human Approval**: Sensitive actions (e.g., persistent note writes, external side effects) halt in `AWAITING_APPROVAL` and issue HMAC-SHA256 one-time approval tokens. Replay attacks are strictly prevented.
-- **Durable Checkpoints & Crash Recovery**: Every step transition and state snapshot is durably committed to PostgreSQL. Interrupted tasks automatically resume from the last valid checkpoint.
-- **Worker Lease Fencing**: Distributed workers maintain heartbeat leases in PostgreSQL. Stale or unresponsive workers are fenced out to eliminate split-brain execution risks.
+- **Durable Checkpoints & Crash Recovery**: Every step transition and state snapshot is durably committed to PostgreSQL. Interrupted tasks automatically resume from the last valid checkpoint without repeating completed side effects.
+- **Worker Lease Fencing**: Distributed workers maintain heartbeat leases with monotonic fencing tokens in PostgreSQL. Stale or unresponsive workers are fenced out to eliminate split-brain execution risks.
 - **Immutable Audit Trail**: Step history and state transitions are recorded in `agent_execution_logs` protected by PostgreSQL database triggers that reject raw modifications.
 
 ### 🖥️ Eight Interactive Workspaces
@@ -180,10 +181,10 @@ Open your browser at `http://localhost:5173`.
 
 ## 🧪 Testing & Verification
 
-MEMORA AI includes 15 automated test suites. Execute them using the unified test runner:
+MEMORA AI includes 16 automated test suites. Execute them using the unified test runner:
 
 ```powershell
-# List all 15 registered test suites
+# List all 16 registered test suites
 python backend/run_all_tests.py --list
 
 # Run all test suites
@@ -193,7 +194,7 @@ python backend/run_all_tests.py --all
 python backend/run_all_tests.py --skip-live
 
 # Run a specific suite
-python backend/run_all_tests.py --suite test_day7_hardening.py
+python backend/run_all_tests.py --suite test_serverless_slices.py
 
 # Verify frontend production build and linting
 cd frontend
@@ -207,16 +208,18 @@ Refer to [`docs/TESTING.md`](docs/TESTING.md) for detailed test documentation.
 
 ## 🌐 Deployment Architecture
 
-MEMORA AI is deployed across two specialized cloud providers:
+MEMORA AI is deployed exclusively on **Vercel** with **Neon Serverless PostgreSQL** and **Nebius TokenFactory**:
 
 | Tier | Hosting Service | Configuration File | Purpose |
 |---|---|---|---|
-| **Frontend** | **Vercel** Static Site | `frontend/vercel.json` | High-speed global edge CDN hosting the React 19 SPA |
-| **Backend** | **Render** Web Service | `render.yaml` & `backend/Dockerfile` | Persistent Docker container hosting FastAPI, ASGI connection pooling, and agent DAG execution |
-| **Database** | **Neon** Serverless | — | PostgreSQL 16+ with `vector(1024)` |
+| **Frontend** | **Vercel** Static Site | `vercel.json` | High-speed global edge CDN hosting the React 19 SPA |
+| **Backend** | **Vercel** Serverless Functions | `api/index.py` & `vercel.json` | Ephemeral Python ASGI serverless functions with bounded execution slices |
+| **Database** | **Neon** Serverless | — | PostgreSQL 16+ with `vector(1024)` & PgBouncer pooling |
+| **Inference** | **Nebius** TokenFactory | — | LLM reasoning & 1024-dim vector embeddings |
+| **Cron** | **Vercel** Cron Jobs | `vercel.json` | Automated stale task lease recovery (`/api/agent/cron/recover`) |
 
 > [!NOTE]
-> **Serverless Backend Compatibility**: The backend is hosted as a persistent container on Render rather than Vercel Serverless because multi-step agent DAG execution, worker lease heartbeats, and crash-resilient checkpoints require long-lived execution contexts that exceed serverless execution limits.
+> **Serverless Execution Architecture**: The backend utilizes bounded execution slices (`POST /api/agent/tasks/{task_id}/step`) and PostgreSQL-backed durable checkpoints to execute multi-step agent DAGs reliably within Vercel's serverless timeout constraints.
 
 Refer to [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for step-by-step deployment instructions.
 

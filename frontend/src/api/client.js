@@ -278,6 +278,29 @@ export const api = {
     return res.task || res;
   },
 
+  async createAgentTask(sessionId, instruction, requireApproval = false, maxSteps = 10) {
+    const res = await request("/api/agent/tasks", {
+      method: "POST",
+      sessionId,
+      body: JSON.stringify({
+        session_id: sessionId,
+        instruction,
+        message: instruction,
+        require_approval: requireApproval,
+        max_steps: maxSteps,
+      }),
+    });
+    return res.task || res;
+  },
+
+  async stepAgentTask(sessionId, taskId) {
+    const res = await request(`/api/agent/tasks/${taskId}/step?session_id=${encodeURIComponent(sessionId)}`, {
+      method: "POST",
+      sessionId,
+    });
+    return res.task || res;
+  },
+
   async listTasks(sessionId, limit = 50) {
     return request(`/api/agent/tasks?session_id=${encodeURIComponent(sessionId)}&limit=${limit}`, {
       sessionId,
