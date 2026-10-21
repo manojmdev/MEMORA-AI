@@ -12,6 +12,8 @@ import {
   Sparkles,
   Check,
   X,
+  HelpCircle,
+  Send,
 } from "lucide-react";
 import { Modal } from "../common/Modal";
 import { EmptyState } from "../common/EmptyState";
@@ -23,6 +25,7 @@ export function AgentWorkspaceView({
   onSubmitTask,
   onApproveTask,
   onRejectTask,
+  onClarifyTask,
   onCancelTask,
   onRetryTask,
   checkpoints,
@@ -36,6 +39,7 @@ export function AgentWorkspaceView({
   const [showCheckpointsModal, setShowCheckpointsModal] = useState(false);
   const [rejectReason, setRejectReason] = useState("");
   const [showRejectModal, setShowRejectModal] = useState(false);
+  const [clarificationText, setClarificationText] = useState("");
   const [actionLoading, setActionLoading] = useState(false);
 
   const handleSubmit = (e) => {
@@ -46,7 +50,7 @@ export function AgentWorkspaceView({
 
   const handleApprove = async () => {
     if (!activeTask) return;
-    const approvalToken = activeTask.plan?.approval_token;
+    const approvalToken = activeTask.approval_token || activeTask.pending_approval?.approval_token || activeTask.plan?.approval_token;
     if (!approvalToken) {
       showToast("No cryptographic approval token present on this task", "error");
       return;
@@ -64,7 +68,7 @@ export function AgentWorkspaceView({
 
   const handleReject = async () => {
     if (!activeTask) return;
-    const approvalToken = activeTask.plan?.approval_token;
+    const approvalToken = activeTask.approval_token || activeTask.pending_approval?.approval_token || activeTask.plan?.approval_token;
     if (!approvalToken) return;
     setActionLoading(true);
     try {
@@ -74,6 +78,20 @@ export function AgentWorkspaceView({
       setRejectReason("");
     } catch (e) {
       showToast(e.message || "Rejection failed", "error");
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleClarify = async (e) => {
+    e?.preventDefault();
+    if (!activeTask || !clarificationText.trim() || !onClarifyTask) return;
+    setActionLoading(true);
+    try {
+      await onClarifyTask(activeTask.id, clarificationText.trim());
+      setClarificationText("");
+    } catch (e) {
+      showToast(e.message || "Clarification failed", "error");
     } finally {
       setActionLoading(false);
     }
@@ -115,8 +133,9 @@ export function AgentWorkspaceView({
   const plan = activeTask?.plan;
   const steps = plan?.steps || [];
   const status = activeTask?.status;
-  const isAwaitingApproval = status === "awaiting_approval";
+  const isAwaitingApproval = status === "awaiting_approval" || !!activeTask?.pending_approval;
   const isNeedsReconciliation = status === "needs_reconciliation";
+  const isAwaitingClarification = status === "awaiting_clarification" || activeTask?.requires_clarification;
 
   return (
     <div
@@ -266,6 +285,53 @@ export function AgentWorkspaceView({
         </div>
       )}
 
+      {/* Awaiting Clarification Card */}
+      {isAwaitingClarification && (
+        <div
+          style={{
+            background: "rgba(99, 102, 241, 0.12)",
+            border: "1px solid rgba(99, 102, 241, 0.35)",
+            borderRadius: "14px",
+            padding: "18px 22px",
+            display: "flex",
+            flexDirection: "column",
+            gap: "14px",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "flex-start", gap: "12px" }}>
+            <HelpCircle size={26} color="#6366f1" style={{ flexShrink: 0, marginTop: "2px" }} />
+            <div style={{ flex: 1 }}>
+              <h4 style={{ margin: "0 0 4px 0", fontSize: "0.95rem", fontWeight: 600, color: "var(--text-primary)" }}>
+                Clarification Required by Agent
+              </h4>
+              <p style={{ margin: 0, fontSize: "0.86rem", color: "var(--text-primary)" }}>
+                {activeTask.clarification_prompt || activeTask.result_summary || "Please specify additional details to proceed with planning."}
+              </p>
+            </div>
+          </div>
+
+          <form onSubmit={handleClarify} style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+            <input
+              type="text"
+              className="input"
+              placeholder="E.g., 'Python Programming', 'Machine Learning', or 'Distributed Systems'..."
+              value={clarificationText}
+              onChange={(e) => setClarificationText(e.target.value)}
+              disabled={actionLoading || running}
+              style={{ flex: 1 }}
+            />
+            <button
+              type="submit"
+              className="btn btn-primary"
+              disabled={!clarificationText.trim() || actionLoading || running}
+              style={{ gap: "6px", whiteSpace: "nowrap" }}
+            >
+              <Send size={14} /> Submit Clarification & Resume
+            </button>
+          </form>
+        </div>
+      )}
+
       {/* Pending Approval Urgent Banner */}
       {isAwaitingApproval && (
         <div
@@ -285,10 +351,10 @@ export function AgentWorkspaceView({
             <ShieldAlert size={28} color="var(--color-warning)" style={{ flexShrink: 0 }} />
             <div>
               <h4 style={{ margin: "0 0 4px 0", fontSize: "0.95rem", fontWeight: 600, color: "var(--text-primary)" }}>
-                Step #{activeTask.current_step_index + 1} Requires Your Cryptographic Approval
+                {activeTask.pending_approval?.operation || "Operation"} Requires Your Cryptographic Approval
               </h4>
               <p style={{ margin: 0, fontSize: "0.82rem", color: "var(--text-secondary)" }}>
-                Tool <code>{steps[activeTask.current_step_index]?.tool_name}</code> is flagged as sensitive. Review the plan below and authorize or reject.
+                Tool <code>{activeTask.pending_approval?.tool_name || "create_note"}</code> is flagged as sensitive. Review the plan below and authorize or reject.
               </p>
             </div>
           </div>

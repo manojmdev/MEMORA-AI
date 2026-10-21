@@ -51,6 +51,7 @@ from app.agent.models import (
     AgentRunRequest,
     AgentTaskResponse,
     ApprovalActionRequest,
+    ClarificationActionRequest,
     AgentTask,
     AgentTaskCheckpoint,
     AgentExecutionEvent,
@@ -386,8 +387,10 @@ async def run_agent_task(
     valid_sid = validate_session_id(request.session_id, principal)
     try:
         return await agent_orchestrator.run_agent_task(
-            message=request.message,
-            session_id=valid_sid
+            message=request.effective_instruction,
+            session_id=valid_sid,
+            require_approval=request.require_approval,
+            max_steps=request.max_steps
         )
     except HTTPException:
         raise
@@ -533,6 +536,33 @@ async def retry_agent_task(
         raise
     except Exception as e:
         raise safe_internal_error(e, "Task retry failed", req)
+
+@app.post("/api/agent/tasks/{task_id}/clarify", response_model=AgentTaskResponse)
+async def clarify_agent_task(
+    task_id: UUID,
+    request: ClarificationActionRequest,
+    req: Request,
+    principal: UserPrincipal = Depends(get_current_principal)
+):
+    """
+    Provide user clarification for an agent task in AWAITING_CLARIFICATION state.
+    Resumes planning and execution with the augmented objective.
+    """
+    valid_sid = validate_session_id(request.session_id or "default-session", principal)
+    try:
+        return await agent_orchestrator.clarify_task(
+            session_id=valid_sid,
+            task_id=task_id,
+            clarification=request.clarification
+        )
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise safe_internal_error(e, "Task clarification failed", req)
 
 @app.get("/api/agent/tasks/{task_id}/checkpoints", response_model=List[AgentTaskCheckpoint])
 async def get_agent_task_checkpoints(

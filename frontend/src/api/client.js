@@ -264,16 +264,18 @@ export const api = {
 
   // Agent Intelligence & Execution
   async runAgent(sessionId, instruction, requireApproval = false, maxSteps = 10) {
-    return request("/api/agent/run", {
+    const res = await request("/api/agent/run", {
       method: "POST",
       sessionId,
       body: JSON.stringify({
         session_id: sessionId,
         instruction,
+        message: instruction,
         require_approval: requireApproval,
         max_steps: maxSteps,
       }),
     });
+    return res.task || res;
   },
 
   async listTasks(sessionId, limit = 50) {
@@ -289,43 +291,62 @@ export const api = {
   },
 
   async approveTask(sessionId, taskId, approvalToken, feedback = null) {
-    return request(`/api/agent/tasks/${taskId}/approve?session_id=${encodeURIComponent(sessionId)}`, {
+    const res = await request(`/api/agent/tasks/${taskId}/approve?session_id=${encodeURIComponent(sessionId)}`, {
       method: "POST",
       sessionId,
       body: JSON.stringify({
+        session_id: sessionId,
         approval_token: approvalToken,
         feedback,
       }),
     });
+    return res.task || res;
   },
 
   async rejectTask(sessionId, taskId, approvalToken, reason = "Rejected by user") {
-    return request(`/api/agent/tasks/${taskId}/reject?session_id=${encodeURIComponent(sessionId)}`, {
+    const res = await request(`/api/agent/tasks/${taskId}/reject?session_id=${encodeURIComponent(sessionId)}`, {
       method: "POST",
       sessionId,
       body: JSON.stringify({
+        session_id: sessionId,
         approval_token: approvalToken,
         reason,
       }),
     });
+    return res.task || res;
+  },
+
+  async clarifyTask(sessionId, taskId, clarification) {
+    const res = await request(`/api/agent/tasks/${taskId}/clarify?session_id=${encodeURIComponent(sessionId)}`, {
+      method: "POST",
+      sessionId,
+      body: JSON.stringify({
+        session_id: sessionId,
+        clarification,
+      }),
+    });
+    return res.task || res;
   },
 
   async cancelTask(sessionId, taskId, reason = "Cancelled by user") {
-    return request(`/api/agent/tasks/${taskId}/cancel?session_id=${encodeURIComponent(sessionId)}`, {
+    const res = await request(`/api/agent/tasks/${taskId}/cancel?session_id=${encodeURIComponent(sessionId)}`, {
       method: "POST",
       sessionId,
       body: JSON.stringify({ reason }),
     });
+    return res.task || res;
   },
 
   async retryTask(sessionId, taskId, fromCheckpointId = null) {
-    return request(`/api/agent/tasks/${taskId}/retry?session_id=${encodeURIComponent(sessionId)}`, {
+    const res = await request(`/api/agent/tasks/${taskId}/retry?session_id=${encodeURIComponent(sessionId)}`, {
       method: "POST",
       sessionId,
       body: JSON.stringify({
+        session_id: sessionId,
         from_checkpoint_id: fromCheckpointId,
       }),
     });
+    return res.task || res;
   },
 
   async getTaskCheckpoints(sessionId, taskId) {

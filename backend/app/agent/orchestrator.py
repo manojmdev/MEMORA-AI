@@ -59,17 +59,26 @@ class AgentOrchestrator:
         self,
         message: str = "",
         session_id: str = "default-session",
-        user_request: Optional[str] = None
+        user_request: Optional[str] = None,
+        require_approval: Optional[bool] = None,
+        max_steps: int = 6
     ) -> AgentTaskResponse:
-        """Alias for run_task supporting message and session_id keyword arguments."""
+        """Alias for run_task supporting message, session_id, require_approval, and max_steps keyword arguments."""
         req = message or user_request or ""
-        return await self.run_task(session_id=session_id, user_request=req)
+        return await self.run_task(
+            session_id=session_id,
+            user_request=req,
+            require_approval=require_approval,
+            max_steps=max_steps
+        )
 
     async def run_task(
         self,
         session_id: str = "default-session",
         user_request: str = "",
-        message: Optional[str] = None
+        message: Optional[str] = None,
+        require_approval: Optional[bool] = None,
+        max_steps: int = 6
     ) -> AgentTaskResponse:
         """
         Execute an agent task:
@@ -80,6 +89,18 @@ class AgentOrchestrator:
         req = user_request or message or ""
         clean_session = session_id.strip() if session_id else "default-session"
         clean_request = req.strip()
+
+        # Determine effective require_approval setting
+        prompt_lower = clean_request.lower()
+        has_explicit_approval_cue = any(phrase in prompt_lower for phrase in [
+            "require approval", "with approval", "ask for approval", "await approval", "require confirmation"
+        ])
+        if require_approval is not None:
+            effective_require_approval = require_approval or has_explicit_approval_cue
+        elif has_explicit_approval_cue:
+            effective_require_approval = True
+        else:
+            effective_require_approval = True
 
         task_id = uuid4()
         now = datetime.now(timezone.utc)
@@ -123,7 +144,7 @@ class AgentOrchestrator:
         proposed_plan = await generate_plan(
             user_request=clean_request,
             retrieved_memories=recalled_memories,
-            max_steps=6
+            max_steps=max_steps
         )
 
         # 3b. Check for clarification requirement
@@ -153,7 +174,7 @@ class AgentOrchestrator:
             )
 
         # 4. Validate plan authoritatively
-        is_valid, plan, validation_error = validate_plan(proposed_plan)
+        is_valid, plan, validation_error = validate_plan(proposed_plan, require_approval=effective_require_approval)
         if not is_valid:
             task = AgentTask(
                 id=task_id,
@@ -957,6 +978,86 @@ class AgentOrchestrator:
             checkpoints=checkpoints
         )
 
+    async def clarify_task(
+        self,
+        session_id: str,
+        task_id: UUID,
+        clarification: str
+    ) -> AgentTaskResponse:
+        """Provide clarification for a task awaiting clarification and resume planning/execution."""
+        clean_session = session_id.strip()
+        if isinstance(task_id, str):
+            task_id = UUID(task_id)
+
+        task = await self.get_task(clean_session, task_id)
+        if not task:
+            raise ValueError(f"Task '{task_id}' not found for session '{clean_session}'.")
+
+        if task.status != TaskStatus.AWAITING_CLARIFICATION:
+            raise ValueError(f"Task is in status '{task.status.value}', not awaiting clarification.")
+
+        clean_clarification = clarification.strip()
+        if not clean_clarification:
+            raise ValueError("Clarification text cannot be empty.")
+
+        augmented_request = f"{task.user_request} (Subject/Detail: {clean_clarification})"
+        task.user_request = augmented_request
+        task.requires_clarification = False
+        task.clarification_prompt = None
+        task.status = TaskStatus.PLANNING
+        task.updated_at = datetime.now(timezone.utc)
+        await self._update_task_record(task)
+
+        # Concurrently retrieve memories and generate plan
+        recalled_memories_task = retrieve_hybrid_memories(clean_session, augmented_request, limit=4)
+        intent_task = analyze_intent(augmented_request)
+        recalled_memories, intent_data = await asyncio.gather(
+            recalled_memories_task,
+            intent_task
+        )
+        task.task_type = intent_data.get("intent", "general")
+
+        proposed_plan = await generate_plan(augmented_request, recalled_memories, max_steps=6)
+        if proposed_plan.requires_clarification:
+            task.status = TaskStatus.AWAITING_CLARIFICATION
+            task.requires_clarification = True
+            task.clarification_prompt = proposed_plan.clarification_prompt
+            task.result_summary = proposed_plan.clarification_prompt
+            await self._update_task_record(task)
+            reply = proposed_plan.clarification_prompt or "Further clarification is needed."
+            return AgentTaskResponse(
+                task=task,
+                reply=reply,
+                memories_used=[m.model_dump(mode="json") if hasattr(m, "model_dump") else m for m in recalled_memories],
+                tools_executed=[],
+                execution_timeline=[]
+            )
+
+        # Check approval preference
+        prompt_lower = augmented_request.lower()
+        eff_approval = any(phrase in prompt_lower for phrase in [
+            "require approval", "with approval", "ask for approval", "await approval", "require confirmation"
+        ])
+        is_valid, plan, validation_error = validate_plan(proposed_plan, require_approval=eff_approval)
+        if not is_valid:
+            task.status = TaskStatus.FAILED
+            task.result_summary = f"Plan validation failed: {validation_error}"
+            task.completed_at = datetime.now(timezone.utc)
+            await self._update_task_record(task)
+            return AgentTaskResponse(
+                task=task,
+                reply=f"Task planning failed validation: {validation_error}",
+                memories_used=[m.model_dump(mode="json") if hasattr(m, "model_dump") else m for m in recalled_memories],
+                tools_executed=[],
+                execution_timeline=[]
+            )
+
+        task.plan = plan
+        task.status = TaskStatus.RUNNING
+        await self._update_task_record(task)
+        await checkpoint_manager.init_task_checkpoints(task.id, task.session_id, plan)
+        return await self._execute_plan_steps(task, recalled_memories)
+
     async def retry_task(
         self,
         session_id: str,
@@ -969,6 +1070,18 @@ class AgentOrchestrator:
         task = await self.get_task(clean_session, task_id)
         if not task or not task.plan:
             raise ValueError("Task or plan could not be restored for retry.")
+
+        if task.status in (TaskStatus.SUCCEEDED, TaskStatus.COMPLETED):
+            checkpoints = await checkpoint_manager.get_task_checkpoints(task_id, clean_session)
+            task.checkpoints = checkpoints
+            return AgentTaskResponse(
+                task=task,
+                reply=f"Task is already {task.status.value}. Resumption is not required.",
+                checkpoints=checkpoints
+            )
+
+        if task.status == TaskStatus.CANCELLED:
+            raise ValueError(f"Cannot resume cancelled task {task_id}: task is in terminal status 'cancelled'. Resuming a cancelled task is disallowed by terminal state policy.")
 
         # Reopen failed, retrying, or needs_reconciliation steps
         for step in task.plan.steps:

@@ -151,8 +151,14 @@ class ApprovalRequest(BaseModel):
     expires_at: datetime
 
 class ApprovalActionRequest(BaseModel):
-    session_id: str
+    session_id: Optional[str] = Field(default="default-session", description="Session identifier")
     approval_token: Optional[str] = None
+    reason: Optional[str] = None
+    feedback: Optional[str] = None
+
+class ClarificationActionRequest(BaseModel):
+    session_id: Optional[str] = Field(default="default-session", description="Session identifier")
+    clarification: str = Field(..., min_length=1, max_length=5000, description="User clarification text")
 
 class ApprovalResponse(BaseModel):
     task_id: UUID
@@ -248,8 +254,15 @@ class AgentTaskResponse(BaseModel):
     checkpoints: List[AgentTaskCheckpoint] = Field(default_factory=list)
 
 class AgentRunRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=10000, description="User instruction for the agent")
+    message: Optional[str] = Field(default=None, max_length=10000, description="User instruction for the agent")
+    instruction: Optional[str] = Field(default=None, max_length=10000, description="Alias for message")
     session_id: str = Field(default="default-session", min_length=1, max_length=255, description="Session identifier")
+    require_approval: Optional[bool] = Field(default=None, description="Require manual approval for side-effect operations")
+    max_steps: int = Field(default=6, description="Maximum execution steps allowed")
+
+    @property
+    def effective_instruction(self) -> str:
+        return (self.message or self.instruction or "").strip()
 
 class NoteRecord(BaseModel):
     id: UUID

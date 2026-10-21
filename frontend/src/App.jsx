@@ -321,6 +321,20 @@ function AppContent() {
     await fetchTasks();
   };
 
+  const handleClarifyTask = async (taskId, clarification) => {
+    setAgentRunning(true);
+    try {
+      const updated = await api.clarifyTask(sessionId, taskId, clarification);
+      setActiveTask(updated);
+      showToast("Clarification submitted. Resuming execution.", "success");
+      await fetchTasks();
+    } catch (e) {
+      showToast(e.message || "Failed to submit clarification", "error");
+    } finally {
+      setAgentRunning(false);
+    }
+  };
+
   const handleCancelTask = async (taskId, reason) => {
     const updated = await api.cancelTask(sessionId, taskId, reason);
     setActiveTask(updated);
@@ -483,6 +497,7 @@ function AppContent() {
               onSubmitTask={handleSubmitAgentTask}
               onApproveTask={handleApproveTask}
               onRejectTask={handleRejectTask}
+              onClarifyTask={handleClarifyTask}
               onCancelTask={handleCancelTask}
               onRetryTask={handleRetryTask}
               checkpoints={taskCheckpoints}

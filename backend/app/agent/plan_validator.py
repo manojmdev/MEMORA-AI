@@ -15,7 +15,7 @@ def generate_step_idempotency_key(step_id: str, tool_name: Optional[str], argume
     payload = f"{step_id}:{tool_name or 'none'}:{json.dumps(arguments or {}, sort_keys=True)}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-def validate_plan(plan: AgentPlan) -> Tuple[bool, AgentPlan, Optional[str]]:
+def validate_plan(plan: AgentPlan, require_approval: Optional[bool] = None) -> Tuple[bool, AgentPlan, Optional[str]]:
     """
     Validates proposed AgentPlan:
     1. Step count must be between 1 and MAX_PLAN_STEPS.
@@ -57,12 +57,15 @@ def validate_plan(plan: AgentPlan) -> Tuple[bool, AgentPlan, Optional[str]]:
             tool_name = step.tool_name.strip()
             # Authoritative policy assignment
             permission = policy_engine.get_permission(tool_name)
-            step.permission = permission
+            if require_approval is False and permission == ToolPermission.APPROVAL_REQUIRED:
+                step.permission = ToolPermission.AUTOMATIC
+            else:
+                step.permission = permission
 
             if permission == ToolPermission.BLOCKED:
                 return False, plan, f"Step '{sid}' references disallowed or unregistered tool '{tool_name}'."
 
-            if permission == ToolPermission.APPROVAL_REQUIRED:
+            if step.permission == ToolPermission.APPROVAL_REQUIRED:
                 requires_approval = True
 
             tool = tool_registry.get_tool(tool_name)
